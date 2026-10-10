@@ -1,4 +1,4 @@
-"""5-minute signal alert for the C and E models (no AI needed), pushed to Telegram.
+"""5-minute signal alert for the E model only (no AI needed), pushed to Telegram.
 
 Rules (identical to scans/d_model/e_model.py and the C-R5 file; nothing added):
   E long : BTC 5m close < 48 bars ago; coin 24h quote vol >= 10M; 24h change <= 0;
@@ -102,10 +102,8 @@ def check(sym, t, a, btc_up, btc_down, tick):
     out = []
     if c[-1] > h[-1 - N:-1].max() * (1 + EXT) and ch24 <= 0 and btc_down \
             and not any(c[-1 - k] > h[-1 - k - N:-1 - k].max() for k in range(1, LB + 1)):
-        stop = l[-LB:].min() - tick
-        models = (["E做多"] if qv24 >= 10e6 else []) + (["C"] if qv24 >= 5e6 else [])
-        if models:
-            out.append(("long", models, stop, qv24, ch24))
+        if qv24 >= 10e6:
+            out.append(("long", ["E做多"], l[-LB:].min() - tick, qv24, ch24))
     if c[-1] < l[-1 - N:-1].min() * (1 - EXT) and ch24 >= 0 and btc_up and qv24 >= 10e6 \
             and not any(c[-1 - k] < l[-1 - k - N:-1 - k].min() for k in range(1, LB + 1)):
         out.append(("short", ["E做空"], h[-LB:].max() + tick, qv24, ch24))
@@ -148,7 +146,7 @@ def one_pass(meta, last_done):
                 f"{'🟢做多' if side == 'long' else '🔴做空'} {sym} [{'+'.join(models)}]{note}\n"
                 f"📌 入场价 {ref:.6g}（限价单，挂到 {bj(bar + 600_000)} 没成交就撤，不追）\n"
                 f"🛑 止损价 {stop:.6g}（距离 {dist * 100:.2f}%，下单同时挂好）\n"
-                f"⏱ 平仓：E 在 {bj(bar + 300_000 + 4 * 3_600_000)} 手动市价平仓（不设固定止盈）；C 按 15m 保护点抬止损\n"
+                f"⏱ 平仓：E 在 {bj(bar + 300_000 + 4 * 3_600_000)} 手动市价平仓（不设固定止盈）\n"
                 f"{eq:.0f}U 风险 {risk:.1f}U → 仓位约 {notional:.0f}U，杠杆 ≤{lev}x，保证金约 {notional / lev:.1f}U\n"
                 f"24h 额 {qv24 / 1e6:.0f}M，24h {ch24 * 100:+.1f}%")
     if lines:
@@ -167,7 +165,7 @@ def main():
         send(f"⚠️ 提醒脚本连不上币安：{e}")
         raise
     if os.environ.get("HEARTBEAT", "1") == "1":
-        send(f"✅ C/E 信号监控已启动，持续约 {duration // 3600} 小时，每 5 分钟检查一次（{len(meta)} 个币）")
+        send(f"✅ E 信号监控已启动，持续约 {duration // 3600} 小时，每 5 分钟检查一次（{len(meta)} 个币）")
     last, errors = None, 0
     while True:
         try:
