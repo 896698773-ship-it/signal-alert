@@ -23,7 +23,7 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: "8623876357"
           EQUITY: "100"
-          RISK_LONG: "0.02"
+          RISK_LONG: "0.10"
           RISK_SHORT: "0.01"
           DURATION: "21000"
           HEARTBEAT: "1"
