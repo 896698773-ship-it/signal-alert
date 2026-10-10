@@ -57,11 +57,13 @@ def send(text):
             r = S.post(f"https://api.telegram.org/bot{tok}/sendMessage",
                        json={"chat_id": chat, "text": text, "disable_web_page_preview": True}, timeout=20)
             if r.status_code == 200:
+                print("telegram sent:", text[:60].replace("\n", " "), flush=True)
                 return
-        except requests.RequestException:
-            pass
+            print("telegram error", r.status_code, r.text[:300], flush=True)
+        except requests.RequestException as e:
+            print("telegram request failed:", e, flush=True)
         time.sleep(3)
-    print("telegram send failed:", text[:200])
+    print("telegram send failed:", text[:200], flush=True)
 
 
 def get(path, **params):

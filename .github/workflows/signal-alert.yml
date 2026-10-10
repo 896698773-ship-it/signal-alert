@@ -4,7 +4,11 @@ name: signal-alert
 on:
   schedule:
     - cron: "0 */6 * * *"   # start a 6-hour monitoring job every 6 hours
-  workflow_dispatch: {}      # allows a manual start from the Actions tab
+  workflow_dispatch:         # allows a manual start from the Actions tab
+    inputs:
+      duration:
+        description: "Seconds to keep running"
+        default: "21000"
 concurrency:
   group: signal-alert
   cancel-in-progress: false
@@ -20,7 +24,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install requests numpy
-      - run: python alert/signal_alert.py
+      - run: python -u alert/signal_alert.py
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: "8623876357"
@@ -30,5 +34,5 @@ jobs:
           RISK_C: "0.06"
           RISK_D: "0.06"
           CAP_D: "0.01"
-          DURATION: "21000"
+          DURATION: ${{ inputs.duration || '21000' }}
           HEARTBEAT: "1"
