@@ -12,6 +12,8 @@ jobs:
   watch:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    permissions:
+      contents: write   # the daily record is committed to records/
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

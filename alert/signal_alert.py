@@ -17,6 +17,9 @@ and trailing stops), so an exit notice is also sent when their stop is hit or th
 
 Each cycle checks only the last CLOSED 5m bar, so a signal is sent once.
 
+Daily record: after 08:00 Beijing time the previous day is replayed with the same rules (every trade that
+closed that day, as pushed), sent as "昨日战绩" and appended to records/daily.csv / daily.md in the repo.
+
 Environment variables:
   TELEGRAM_TOKEN, TELEGRAM_CHAT_ID  (required to send; without them the message is printed)
   EQUITY (default 100), RISK_LONG (0.02), RISK_SHORT (0.01), RISK_C (0.02), RISK_D (0.02), CAP_D (0.01)
@@ -24,6 +27,7 @@ Environment variables:
 """
 import math
 import os
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -362,6 +366,136 @@ def one_pass(meta, last_done):
     return bar
 
 
+# ---------------------------------------------------------------- daily record
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REC = os.path.join(ROOT, "records")
+DAY_MS = 86_400_000
+
+
+def git(*args):
+    try:
+        return subprocess.run(["git", "-C", ROOT, *args], capture_output=True, text=True, timeout=120).returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def e_closed(fdata, tb, ab, meta, d0, d1):
+    """E trades as pushed (next open, stop, close 4 h after entry) that exit inside [d0, d1)."""
+    out, bpos = [], {v: j for j, v in enumerate(tb)}
+    for s, (t, a) in fdata.items():
+        o, h, l, c = a[:, 0], a[:, 1], a[:, 2], a[:, 3]
+        for i in range(300, len(t) - 1):
+            if t[i] < d0 - 49 * 300_000 or t[i] >= d1 or t[i] not in bpos:
+                continue
+            j = bpos[t[i]]
+            bd, bu = ab[j, 3] < ab[j - N, 3], ab[j, 3] > ab[j - N, 3]
+            for side, models, stop, _, _ in check(s, t[:i + 1], a[:i + 1], bu, bd, meta[s]["tick"]):
+                sg, e, px, k = (1 if side == "long" else -1), i + 1, None, i + 1
+                while k < len(t) and k <= i + 48:
+                    if k > e and sg * (stop - o[k]) >= 0:
+                        px = o[k]
+                    elif (l[k] <= stop) if sg == 1 else (h[k] >= stop):
+                        px = stop
+                    elif k == i + 48:
+                        px = c[k]
+                    if px is not None:
+                        break
+                    k += 1
+                if px is not None and d0 <= t[k] < d1:
+                    r0 = abs(o[e] - stop) / o[e] + 2 * FEE
+                    out.append(dict(model=models[0], sym=s, t=t[e], R=(sg * (px / o[e] - 1) - 2 * FEE) / r0))
+    return out
+
+
+def daily_summary(meta, d0):
+    """Replay the day starting at d0 (Beijing midnight, ms): every C / D / E trade that closed that day."""
+    d1, now = d0 + DAY_MS, int(time.time() * 1000)
+    eq = float(os.environ.get("EQUITY", "100"))
+    rl, rs = float(os.environ.get("RISK_LONG", "0.02")), float(os.environ.get("RISK_SHORT", "0.01"))
+    rc, rd = float(os.environ.get("RISK_C", "0.02")), float(os.environ.get("RISK_D", "0.02"))
+    capd = float(os.environ.get("CAP_D", "0.01"))
+    need = min(1000, int((now - d0) / 300_000) + 360)
+    time.sleep(60)  # let the 5-minute pass's request weight leave Binance's one-minute window first
+
+    def fetch(sym):
+        time.sleep(0.8)  # about 5 requests per second over 4 threads keeps the request weight low
+        try:
+            return sym, closed_klines(sym, now, limit=need)
+        except Exception:  # noqa: BLE001
+            return sym, ([], None)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        fdata = {s: (t, a) for s, (t, a) in pool.map(fetch, list(meta)) if t and len(t) >= 120}
+    tb, ab = fdata["BTCUSDT"]
+    E = e_closed(fdata, tb, ab, meta, d0, d1)
+    dd = {s: (t, a, *rsi_atr(a)) for s, (t, a) in fdata.items()}
+    dlog, clog = [], []
+    dpos, _, _ = d_run(dd, meta, eq, rd, capd, [v for v in tb if v >= d0 - 72 * 300_000], tb[-1], dlog)
+    D = [dict(model="D", sym=x["sym"], t=x["entry_t"], R=(x["sg"] * (x["px"] - x["fill"]) - FEE * (x["fill"] + x["px"])) / x["unit"])
+         for x in dlog if d0 <= x["exit_t"] < d1]
+    tc, ac = closed_klines("ETHUSDT", now, limit=1000)
+    cpos, _, _ = c_run(tc, ac, rsi_atr(ac)[1], tc[-1], clog)
+    C = [dict(model="C", sym="ETHUSDT", t=x["entry_t"],
+              R=((x["fill"] - x["px"]) / x["fill"] - 2 * FEE) / ((x["stop"] - x["fill"]) / x["fill"] + 2 * FEE))
+         for x in clog if d0 <= x["exit_t"] < d1]
+    el, es = [x for x in E if x["model"] == "E做多"], [x for x in E if x["model"] == "E做空"]
+
+    def block(name, L, unit):
+        if not L:
+            return f"{name}：0 笔"
+        r = sum(x["R"] for x in L)
+        return "\n".join([f"{name}：{len(L)} 笔（赚 {sum(x['R'] > 0 for x in L)} 亏 {sum(x['R'] <= 0 for x in L)}），合计 {r:+.2f}R（{r * unit:+.1f}U）"]
+                         + [f"  {bj(x['t']) if x['t'] < d0 else bj(x['t'])[6:]} {x['sym']} {x['R']:+.2f}R"
+                            for x in sorted(L, key=lambda x: x["t"])])
+
+    u = sum(x["R"] for x in el) * eq * rl + sum(x["R"] for x in C) * eq * rc + sum(x["R"] for x in D) * eq * rd
+    prev = 0.0
+    p = os.path.join(REC, "daily.csv")
+    if os.path.exists(p):
+        rows = [x.split(",") for x in open(p).read().splitlines()[1:] if x]
+        prev = float(rows[-1][8]) if rows else 0.0
+    day = bj(d0)[:5]
+    opened = [f"{m} {x['sym']}（{bj(x['entry_t'])} 入场）" for m, x in (("D", dpos), ("C", cpos)) if x]
+    text = (f"📊 昨日战绩 {day}（当天平仓的单，按推送的仓位：{eq:.0f}U，每笔风险 {eq * rl:.0f}U）\n\n"
+            + "\n".join([block("E做多", el, eq * rl), block("C做空ETH", C, eq * rc), block("D", D, eq * rd)])
+            + f"\n\n合计 {u:+.1f}U；累计 {prev + u:+.1f}U（{eq:.0f}U → {eq + prev + u:.1f}U）\n"
+            + f"{block('E做空（只记录）', es, eq * rs).splitlines()[0]}"
+            + (f"\n持仓中：{'；'.join(opened)}" if opened else ""))
+    row = ",".join([day, str(len(el)), f"{sum(x['R'] for x in el):.3f}", str(len(C)), f"{sum(x['R'] for x in C):.3f}",
+                    str(len(D)), f"{sum(x['R'] for x in D):.3f}", f"{u:.2f}", f"{prev + u:.2f}", str(len(es)),
+                    f"{sum(x['R'] for x in es):.3f}"])
+    return day, text, row
+
+
+def maybe_daily(meta, state):
+    now = datetime.now(BJT)
+    if now.hour < 8 or time.time() < state.get("next_try", 0):
+        return
+    d0 = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000) - DAY_MS
+    day = bj(d0)[:5]
+    if state.get("done") == day:
+        return
+    git("pull", "-q", "--rebase")
+    p = os.path.join(REC, "daily.csv")
+    if os.path.exists(p) and any(x.startswith(day + ",") for x in open(p)):
+        state["done"] = day
+        return
+    day, text, row = daily_summary(meta, d0)
+    send(text)
+    state["done"] = day
+    os.makedirs(REC, exist_ok=True)
+    new = not os.path.exists(p)
+    with open(p, "a") as f:
+        if new:
+            f.write("date,E_long_n,E_long_R,C_n,C_R,D_n,D_R,day_U,cum_U,E_short_n,E_short_R\n")
+        f.write(row + "\n")
+    with open(os.path.join(REC, "daily.md"), "a") as f:
+        f.write(text + "\n\n---\n\n")
+    if not (git("add", "records") and git("-c", "user.name=signal-alert", "-c", "user.email=signal-alert@users.noreply.github.com",
+                                           "commit", "-q", "-m", f"Daily record {day}") and git("push", "-q")):
+        print("daily record not pushed")
+
+
 def main():
     duration = int(os.environ.get("DURATION", "0"))
     end = time.time() + duration
@@ -372,7 +506,7 @@ def main():
         raise
     if os.environ.get("HEARTBEAT", "1") == "1":
         send(f"✅ C+D+E 信号监控已启动，持续约 {duration // 3600} 小时，每 5 分钟检查一次（{len(meta)} 个币）")
-    last, errors = None, 0
+    last, errors, daily = None, 0, {}
     while True:
         try:
             last = one_pass(meta, last)
@@ -381,6 +515,11 @@ def main():
             errors += 1
             if errors == 3:
                 send(f"⚠️ 提醒脚本连续出错：{e}")
+        try:
+            maybe_daily(meta, daily)
+        except Exception as e:  # noqa: BLE001 - the daily record must never stop the alerts
+            print("daily record failed:", e)
+            daily["next_try"] = time.time() + 3600
         if time.time() >= end:
             break
         nxt = (int(time.time()) // 300 + 1) * 300 + 20  # 20 s after the next 5m close
