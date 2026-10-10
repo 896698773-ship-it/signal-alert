@@ -146,8 +146,9 @@ def one_pass(meta, last_done):
             note = "（建议暂停实盘，仅记录）" if side == "short" else ""
             lines.append(
                 f"{'🟢做多' if side == 'long' else '🔴做空'} {sym} [{'+'.join(models)}]{note}\n"
-                f"信号K线 {bj(bar)} 收盘 {ref:.6g}；入场：下一根开盘（{bj(bar + 300_000)}），过了不追\n"
-                f"止损 {stop:.6g}（距离 {dist * 100:.2f}%）；E 满 4 小时平仓 / C 按 15m 保护点抬止损\n"
+                f"📌 入场价 {ref:.6g}（限价单，挂到 {bj(bar + 600_000)} 没成交就撤，不追）\n"
+                f"🛑 止损价 {stop:.6g}（距离 {dist * 100:.2f}%，下单同时挂好）\n"
+                f"⏱ 平仓：E 在 {bj(bar + 300_000 + 4 * 3_600_000)} 手动市价平仓（不设固定止盈）；C 按 15m 保护点抬止损\n"
                 f"{eq:.0f}U 风险 {risk:.1f}U → 仓位约 {notional:.0f}U，杠杆 ≤{lev}x，保证金约 {notional / lev:.1f}U\n"
                 f"24h 额 {qv24 / 1e6:.0f}M，24h {ch24 * 100:+.1f}%")
     if lines:
