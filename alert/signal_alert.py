@@ -240,13 +240,14 @@ def d_run(data, meta, eq, risk, capp, times, last_t, log=None):
                 if i + 1 < len(t):
                     p = d_open(meta[s], side, atr[i], med12, a[i + 1, 0], eq, risk, capp)
                     if p:
-                        p.update(sym=s, e=i + 1, entry_t=t[i + 1], idx={v: k for k, v in enumerate(t)})
+                        p.update(sym=s, e=i + 1, entry_t=t[i + 1], idx={v: k for k, v in enumerate(t)},
+                                 atr_i=atr[i], med12=med12, px_open=a[i + 1, 0])
                         pos = p
                         break
                 elif T == last_t:
                     p = d_open(meta[s], side, atr[i], med12, a[i, 3], eq, risk, capp)
                     if p:
-                        p.update(sym=s, ref=a[i, 3], atr=atr[i])
+                        p.update(sym=s, ref=a[i, 3], atr=atr[i], med12=med12)
                         pending = p
                         break
     return pos, events, pending
@@ -286,6 +287,30 @@ def fmt_exit(model, pos, ex, bar):
     if ex is None:
         return head + f"到最长持仓时间，{bj(bar + 300_000)} 开盘市价平仓"
     return head + f"{WHY[ex[0]]}，约 {ex[1]:.6g} 已平仓"
+
+
+R_AGGR, CAP_AGGR = float(os.environ.get("RISK_D_AGGR", "0.60")), float(os.environ.get("CAP_D_AGGR", "0.02"))
+
+
+def last_value(col, default=None):
+    """Latest value of a column in records/daily.csv (the D aggressive account is carried there)."""
+    p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "records", "daily.csv")
+    lines = [x for x in open(p).read().splitlines() if x] if os.path.exists(p) else []
+    if len(lines) < 2 or col not in lines[0].split(","):
+        return default
+    return float(lines[-1].split(",")[lines[0].split(",").index(col)])
+
+
+def aggr_line(p, meta, eq_a):
+    """GPT's aggressive D sizing (60% of its own account per stop, notional <= 2% of 12-bar volume), shown apart."""
+    head = f"🔥 GPT激进版（独立账户 {eq_a:.0f}U，目标每笔止损亏 {R_AGGR * 100:.0f}%，和 30% 方案分开）："
+    if eq_a < 5:
+        return head + "账户已亏光，不再下单"
+    q = d_open(meta[p["sym"]], p["side"], p["atr"], p["med12"], p["ref"], eq_a, R_AGGR, CAP_AGGR)
+    if not q:
+        return head + "这单超出仓位或强平限制，跳过"
+    n, lev = q["qty"] * q["fill"], meta[p["sym"]].get("L") or 20
+    return head + f"仓位约 {n:.0f}U，最大杠杆 {lev}x 保证金约 {n / lev:.1f}U，碰止损约亏 {q['qty'] * q['unit']:.1f}U"
 
 
 def fmt_entry(model, p, bar, eq, risk, meta, k_trail, hours, label):
@@ -351,7 +376,8 @@ def one_pass(meta, last_done):
     _, d_events, d_pending = d_run(dd, meta, eq, rd, capd, tb[max(0, len(tb) - 211):], bar)
     lines += [fmt_exit("D", p, ex, bar) for p, ex in d_events if not (ex and ex[0] == "time")]
     if d_pending:
-        lines.append(fmt_entry("D", d_pending, bar, eq, rd, meta, 5, 4, "RSI 极值回头"))
+        lines.append(fmt_entry("D", d_pending, bar, eq, rd, meta, 5, 4, "RSI 极值回头") + "\n"
+                     + aggr_line(d_pending, meta, last_value("D_aggr_eq", 100.0)))
     # C: replay ETHUSDT over ~3.5 days
     tc, ac = closed_klines("ETHUSDT", now_ms, limit=1000)
     if tc and tc[-1] == bar:
@@ -439,6 +465,11 @@ def daily_summary(meta, d0):
               R=((x["fill"] - x["px"]) / x["fill"] - 2 * FEE) / ((x["stop"] - x["fill"]) / x["fill"] + 2 * FEE))
          for x in clog if d0 <= x["exit_t"] < d1]
     el, es = [x for x in E if x["model"] == "E做多"], [x for x in E if x["model"] == "E做空"]
+    a0 = eq_a = last_value("D_aggr_eq", 100.0)  # GPT's aggressive D: its own compounding account
+    for x in sorted((x for x in dlog if d0 <= x["exit_t"] < d1), key=lambda x: x["entry_t"]):
+        q = d_open(meta[x["sym"]], x["side"], x["atr_i"], x["med12"], x["px_open"], eq_a, R_AGGR, CAP_AGGR) if eq_a >= 5 else None
+        if q:
+            eq_a += q["qty"] * (x["sg"] * (x["px"] - q["fill"]) - FEE * (q["fill"] + x["px"]))
 
     def block(name, L, unit):
         if not L:
@@ -459,11 +490,13 @@ def daily_summary(meta, d0):
     text = (f"📊 昨日战绩 {day}（当天平仓的单，按推送的仓位：{eq:.0f}U，每笔风险 {eq * rl:.0f}U）\n\n"
             + "\n".join([block("E做多", el, eq * rl), block("C做空ETH", C, eq * rc), block("D", D, eq * rd)])
             + f"\n\n合计 {u:+.1f}U；累计 {prev + u:+.1f}U（{eq:.0f}U → {eq + prev + u:.1f}U）\n"
-            + f"{block('E做空（只记录）', es, eq * rs).splitlines()[0]}"
+            + f"{block('E做空（只记录）', es, eq * rs).splitlines()[0]}\n"
+            + f"🔥 D 的 GPT 激进版（目标每笔止损亏 {R_AGGR * 100:.0f}%，独立 100U 账户，和 30% 方案分开）："
+            + f"当天 {eq_a - a0:+.1f}U，{a0:.1f}U → {eq_a:.1f}U"
             + (f"\n持仓中：{'；'.join(opened)}" if opened else ""))
     row = ",".join([day, str(len(el)), f"{sum(x['R'] for x in el):.3f}", str(len(C)), f"{sum(x['R'] for x in C):.3f}",
                     str(len(D)), f"{sum(x['R'] for x in D):.3f}", f"{u:.2f}", f"{prev + u:.2f}", str(len(es)),
-                    f"{sum(x['R'] for x in es):.3f}"])
+                    f"{sum(x['R'] for x in es):.3f}", f"{eq_a:.2f}"])
     return day, text, row
 
 
@@ -487,7 +520,7 @@ def maybe_daily(meta, state):
     new = not os.path.exists(p)
     with open(p, "a") as f:
         if new:
-            f.write("date,E_long_n,E_long_R,C_n,C_R,D_n,D_R,day_U,cum_U,E_short_n,E_short_R\n")
+            f.write("date,E_long_n,E_long_R,C_n,C_R,D_n,D_R,day_U,cum_U,E_short_n,E_short_R,D_aggr_eq\n")
         f.write(row + "\n")
     with open(os.path.join(REC, "daily.md"), "a") as f:
         f.write(text + "\n\n---\n\n")
