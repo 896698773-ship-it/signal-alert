@@ -197,11 +197,17 @@ def d_candidates(data, start_t):
 
 
 def d_open(m, side, atr_i, med12, px, eq, risk, capp):
-    """Size a D entry at price px with the size, margin and liquidation limits; None when it must be skipped."""
+    """D entry: stop 2 ATR from the fill, rounded outward to the tick."""
+    sg = 1 if side == "long" else -1
+    raw = px * (1 + sg * SLIP) - sg * 2 * atr_i
+    stop = (math.floor(raw / m["tick"] + 1e-9) if sg == 1 else math.ceil(raw / m["tick"] - 1e-9)) * m["tick"]
+    return sized(m, side, px, stop, med12, eq, risk, capp)
+
+
+def sized(m, side, px, stop, med12, eq, risk, capp):
+    """Size an entry at price px with a given stop under the size, margin and liquidation limits; None = skip."""
     sg = 1 if side == "long" else -1
     fill = px * (1 + sg * SLIP)
-    raw = fill - sg * 2 * atr_i
-    stop = (math.floor(raw / m["tick"] + 1e-9) if sg == 1 else math.ceil(raw / m["tick"] - 1e-9)) * m["tick"]
     if stop <= 0 or sg * (px - stop) <= 0:
         return None
     unit = abs(fill - stop) + FEE * fill + FEE * stop + SLIP * stop
@@ -300,7 +306,21 @@ def last_value(col, default=None):
     lines = [x for x in open(p).read().splitlines() if x] if os.path.exists(p) else []
     if len(lines) < 2 or col not in lines[0].split(","):
         return default
-    return float(lines[-1].split(",")[lines[0].split(",").index(col)])
+    row, k = lines[-1].split(","), lines[0].split(",").index(col)
+    return float(row[k]) if k < len(row) and row[k] else default
+
+
+def e_aggr_line(sym, ref, stop, med12, meta, eq_a):
+    """E long aggressive sizing (60% of its own account per stop, one position at a time), shown apart."""
+    head = f"🔥 E激进版（独立账户 {eq_a:.0f}U，目标每笔止损亏 {R_AGGR * 100:.0f}%，一次只做一笔，和 30% 方案分开）："
+    if eq_a < 5:
+        return head + "账户已亏光，不再下单"
+    q = sized(meta[sym], "long", ref, stop, med12, eq_a, R_AGGR, CAP_AGGR)
+    if not q:
+        return head + "这单超出仓位或强平限制，跳过"
+    n, lev = q["qty"] * q["fill"], meta[sym].get("L") or 20
+    return head + (f"仓位约 {n:.0f}U，最大杠杆 {lev}x 保证金约 {n / lev:.1f}U，碰止损约亏 {q['qty'] * q['unit']:.1f}U；"
+                   f"上一笔激进单还没平仓就跳过这单")
 
 
 def aggr_line(p, meta, eq_a):
@@ -372,7 +392,9 @@ def one_pass(meta, last_done):
                 f"🛑 止损价 {stop:.6g}（距离 {dist * 100:.2f}%，下单同时挂好）\n"
                 f"⏱ 平仓：E 在 {bj(bar + 300_000 + 4 * 3_600_000)} 手动市价平仓（不设固定止盈）\n"
                 f"{eq:.0f}U 风险 {risk:.1f}U → 仓位约 {notional:.0f}U，杠杆 ≤{lev}x，保证金约 {notional / lev:.1f}U\n"
-                f"24h 额 {qv24 / 1e6:.0f}M，24h {ch24 * 100:+.1f}%")
+                f"24h 额 {qv24 / 1e6:.0f}M，24h {ch24 * 100:+.1f}%"
+                + ("\n" + e_aggr_line(sym, ref, stop, float(np.median(a[-12:, 4])), meta, last_value("E_aggr_eq", 100.0))
+                   if side == "long" else ""))
     # D: replay the last ~17.5 h (RSI warmed up on the 100 bars before) across all fresh coins
     dd = {s: (t, a, *rsi_atr(a)) for s, (t, a) in fresh.items() if len(t) >= 120}
     _, d_events, d_pending = d_run(dd, meta, eq, rd, capd, tb[max(0, len(tb) - 211):], bar)
@@ -431,7 +453,8 @@ def e_closed(fdata, tb, ab, meta, d0, d1):
                     k += 1
                 if px is not None and d0 <= t[k] < d1:
                     r0 = abs(o[e] - stop) / o[e] + 2 * FEE
-                    out.append(dict(model=models[0], sym=s, t=t[e], R=(sg * (px / o[e] - 1) - 2 * FEE) / r0))
+                    out.append(dict(model=models[0], sym=s, t=t[e], R=(sg * (px / o[e] - 1) - 2 * FEE) / r0, exit_t=t[k],
+                                    fill=o[e], stop=stop, px=px, med12=float(np.median(a[i - 11:i + 1, 4]))))
     return out
 
 
@@ -467,6 +490,14 @@ def daily_summary(meta, d0):
               R=((x["fill"] - x["px"]) / x["fill"] - 2 * FEE) / ((x["stop"] - x["fill"]) / x["fill"] + 2 * FEE))
          for x in clog if d0 <= x["exit_t"] < d1]
     el, es = [x for x in E if x["model"] == "E做多"], [x for x in E if x["model"] == "E做空"]
+    e0 = eq_e = last_value("E_aggr_eq", 100.0)  # E long aggressive: its own account, one position at a time
+    busy = 0
+    for x in sorted(el, key=lambda x: x["t"]):
+        q = sized(meta[x["sym"]], "long", x["fill"], x["stop"], x["med12"], eq_e, R_AGGR, CAP_AGGR) \
+            if x["t"] >= busy and eq_e >= 5 else None
+        if q:
+            eq_e += q["qty"] * (x["px"] - q["fill"]) - FEE * q["qty"] * (q["fill"] + x["px"])
+            busy = x["exit_t"]
     a0 = eq_a = last_value("D_aggr_eq", 100.0)  # GPT's aggressive D: its own compounding account
     for x in sorted((x for x in dlog if d0 <= x["exit_t"] < d1), key=lambda x: x["entry_t"]):
         q = d_open(meta[x["sym"]], x["side"], x["atr_i"], x["med12"], x["px_open"], eq_a, R_AGGR, CAP_AGGR) if eq_a >= 5 else None
@@ -494,11 +525,12 @@ def daily_summary(meta, d0):
             + f"\n\n合计 {u:+.1f}U；累计 {prev + u:+.1f}U（{eq:.0f}U → {eq + prev + u:.1f}U）\n"
             + f"{block('E做空（只记录）', es, eq * rs).splitlines()[0]}\n"
             + f"🔥 D 的 GPT 激进版（目标每笔止损亏 {R_AGGR * 100:.0f}%，独立 100U 账户，和 30% 方案分开）："
-            + f"当天 {eq_a - a0:+.1f}U，{a0:.1f}U → {eq_a:.1f}U"
+            + f"当天 {eq_a - a0:+.1f}U，{a0:.1f}U → {eq_a:.1f}U\n"
+            + f"🔥 E 做多激进版（目标每笔止损亏 {R_AGGR * 100:.0f}%，一次一笔，独立 100U 账户）：当天 {eq_e - e0:+.1f}U，{e0:.1f}U → {eq_e:.1f}U"
             + (f"\n持仓中：{'；'.join(opened)}" if opened else ""))
     row = ",".join([day, str(len(el)), f"{sum(x['R'] for x in el):.3f}", str(len(C)), f"{sum(x['R'] for x in C):.3f}",
                     str(len(D)), f"{sum(x['R'] for x in D):.3f}", f"{u:.2f}", f"{prev + u:.2f}", str(len(es)),
-                    f"{sum(x['R'] for x in es):.3f}", f"{eq_a:.2f}"])
+                    f"{sum(x['R'] for x in es):.3f}", f"{eq_a:.2f}", f"{eq_e:.2f}"])
     return day, text, row
 
 
@@ -519,11 +551,12 @@ def maybe_daily(meta, state):
     send(text)
     state["done"] = day
     os.makedirs(REC, exist_ok=True)
-    new = not os.path.exists(p)
-    with open(p, "a") as f:
-        if new:
-            f.write("date,E_long_n,E_long_R,C_n,C_R,D_n,D_R,day_U,cum_U,E_short_n,E_short_R,D_aggr_eq\n")
-        f.write(row + "\n")
+    head = "date,E_long_n,E_long_R,C_n,C_R,D_n,D_R,day_U,cum_U,E_short_n,E_short_R,D_aggr_eq,E_aggr_eq"
+    old = [x for x in open(p).read().splitlines() if x] if os.path.exists(p) else [head]
+    width = len(head.split(","))
+    rows = [head] + [x + "," * (width - len(x.split(","))) for x in old[1:]] + [row]
+    with open(p, "w") as f:
+        f.write("\n".join(rows) + "\n")
     with open(os.path.join(REC, "daily.md"), "a") as f:
         f.write(text + "\n\n---\n\n")
     if not (git("add", "records") and git("-c", "user.name=signal-alert", "-c", "user.email=signal-alert@users.noreply.github.com",
