@@ -426,6 +426,7 @@ def one_pass(meta, last_done):
 
 # ---------------------------------------------------------------- F (record only)
 F_X, F_ADDS, F_STEP, F_RISK = 0.25, 5, 0.5, 0.01
+F_WIN, F_WIN_RISK = (8, 12), 0.06  # entries 08:00-11:59 BJT are tracked apart (record only)
 HOUR = 3_600_000
 
 
@@ -436,11 +437,13 @@ def hourly_klines(sym, now_ms, limit=99):
     return [int(x[0]) for x in k], a
 
 
-def f_trades(a, listed=False):
+def f_trades(a, listed=False, adds=None):
     """F on one coin's closed 1h bars (rows open, high, low, close, quote volume). Each trade: signal bar i, entry bar
     e (None = signal on the last bar, entry at the next open), first-unit stop distance D, units [(price, bar)],
     current stop, exit (bar, price, why) or None while open, pend = an add is due at the next open, R when closed.
-    listed = the first row is the coin's first hour, so a signal 24 h after listing counts as a first crossing."""
+    listed = the first row is the coin's first hour, so a signal 24 h after listing counts as a first crossing.
+    adds = the most adds per trade (default F_ADDS)."""
+    max_adds = F_ADDS if adds is None else adds
     out, busy = [], -1
     if len(a) < 25:
         return out
@@ -477,7 +480,7 @@ def f_trades(a, listed=False):
                 x["exit"] = (j, x["stop"], "stop")
             elif j == e + 23:
                 x["exit"] = (j, c[j], "time")
-            elif len(x["units"]) - 1 < F_ADDS and c[j] <= x["units"][-1][0] - F_STEP * D:
+            elif len(x["units"]) - 1 < max_adds and c[j] <= x["units"][-1][0] - F_STEP * D:
                 x["pend"] = True
             if x["exit"]:
                 break
@@ -507,7 +510,8 @@ def f_lines(meta, now_ms, last_open, eq):
         for x in f_trades(a, listed=n < 90):
             if x["e"] is None:
                 ref, D = x["ref"], x["D"]
-                out.append(f"🟣F做空 {sym}（24h 涨 {x['r24'] * 100:.0f}% 后做空，只记录，先不下单）\n"
+                tag = "【08-12 点重点观察】" if F_WIN[0] <= datetime.fromtimestamp(nxt / 1000, BJT).hour < F_WIN[1] else ""
+                out.append(f"🟣F做空 {sym}{tag}（24h 涨 {x['r24'] * 100:.0f}% 后做空，只记录，先不下单）\n"
                            f"📌 入场：下一根 1 小时开盘市价（{bj(nxt)}），参考价 {ref:.6g}\n"
                            f"🛑 止损：成交价 + 2×ATR(1h)，约 {ref + D:.6g}（{D / ref * 100:.1f}%）\n"
                            f"➕ 加仓：1 小时收盘价比上次入场再低 {F_STEP}×止损距离（约 {F_STEP * D / ref * 100:.1f}%）时，"
@@ -624,15 +628,24 @@ def daily_summary(meta, d0):
         except Exception:  # noqa: BLE001
             return sym, ([], None)
 
-    F = []
+    F, F0 = [], []  # with adds (as pushed) / the same signals without adds
     with ThreadPoolExecutor(max_workers=4) as pool:
         for sym, (t, a) in pool.map(fetch_h, list(meta)):
-            for x in f_trades(a, listed=len(t) < hlimit - 5) if t else []:
-                if x["e"] is not None and x["exit"] and d0 <= t[x["exit"][0]] < d1:
-                    F.append(dict(sym=sym, t=t[x["e"]], R=x["R"], adds=len(x["units"]) - 1, exit_t=t[x["exit"][0]]))
+            for L_, adds in ((F, None), (F0, 0)):
+                for x in f_trades(a, listed=len(t) < hlimit - 5, adds=adds) if t else []:
+                    if x["e"] is not None and x["exit"] and d0 <= t[x["exit"][0]] < d1:
+                        L_.append(dict(sym=sym, t=t[x["e"]], R=x["R"], adds=len(x["units"]) - 1, exit_t=t[x["exit"][0]],
+                                       win=F_WIN[0] <= datetime.fromtimestamp(t[x["e"]] / 1000, BJT).hour < F_WIN[1]))
     f0 = eq_f = last_value("F_eq", 100.0)  # F: its own 100U account, 1% risk per trade, compounding
     for x in sorted(F, key=lambda x: x["exit_t"]):
         eq_f *= 1 + F_RISK * x["R"]
+    W0, WA = [x for x in F0 if x["win"]], [x for x in F if x["win"]]  # 08-12 entries: no adds / with adds
+    w0 = eq_w = last_value("F812_eq", 100.0)
+    wa0 = eq_wa = last_value("F812A_eq", 100.0)
+    for x in sorted(W0, key=lambda x: x["exit_t"]):
+        eq_w = max(0.0, eq_w * (1 + F_WIN_RISK * x["R"]))
+    for x in sorted(WA, key=lambda x: x["exit_t"]):
+        eq_wa = max(0.0, eq_wa * (1 + F_WIN_RISK * x["R"]))
 
     def block(name, L, unit):
         if not L:
@@ -661,11 +674,16 @@ def daily_summary(meta, d0):
             + f"\n\n🟣 F 暴涨做空（只记录，含加仓，每笔风险 1%，独立 100U 账户）：{f0:.1f}U → {eq_f:.1f}U\n"
             + block("F", F, f0 * F_RISK)
             + ("\n  加仓：" + "，".join(f"{x['sym']} {x['adds']} 次" for x in sorted(F, key=lambda x: x["t"]) if x["adds"])
-               if any(x["adds"] for x in F) else ""))
+               if any(x["adds"] for x in F) else "")
+            + f"\n\n🕗 F 08-12 点入场（重点观察，独立 100U 账户，每笔风险 {F_WIN_RISK * 100:.0f}%）\n"
+            + f"  不加仓：{len(W0)} 笔，合计 {sum(x['R'] for x in W0):+.2f}R，{w0:.1f}U → {eq_w:.1f}U\n"
+            + f"  允许加仓：{len(WA)} 笔，合计 {sum(x['R'] for x in WA):+.2f}R，{wa0:.1f}U → {eq_wa:.1f}U"
+            + "".join(f"\n  {bj(x['t'])[6:] if x['t'] >= d0 else bj(x['t'])} {x['sym']} 不加仓 {x['R']:+.2f}R" for x in sorted(W0, key=lambda x: x["t"])))
     row = ",".join([day, str(len(el)), f"{sum(x['R'] for x in el):.3f}", str(len(C)), f"{sum(x['R'] for x in C):.3f}",
                     str(len(D)), f"{sum(x['R'] for x in D):.3f}", f"{u:.2f}", f"{prev + u:.2f}", str(len(es)),
                     f"{sum(x['R'] for x in es):.3f}", f"{eq_a:.2f}", f"{eq_e:.2f}", str(len(F)),
-                    f"{sum(x['R'] for x in F):.3f}", f"{eq_f:.2f}"])
+                    f"{sum(x['R'] for x in F):.3f}", f"{eq_f:.2f}", str(len(W0)), f"{sum(x['R'] for x in W0):.3f}",
+                    f"{eq_w:.2f}", f"{eq_wa:.2f}"])
     return day, text, row
 
 
@@ -686,7 +704,7 @@ def maybe_daily(meta, state):
     send(text)
     state["done"] = day
     os.makedirs(REC, exist_ok=True)
-    head = "date,E_long_n,E_long_R,C_n,C_R,D_n,D_R,day_U,cum_U,E_short_n,E_short_R,D_aggr_eq,E_aggr_eq,F_n,F_R,F_eq"
+    head = "date,E_long_n,E_long_R,C_n,C_R,D_n,D_R,day_U,cum_U,E_short_n,E_short_R,D_aggr_eq,E_aggr_eq,F_n,F_R,F_eq,F812_n,F812_R,F812_eq,F812A_eq"
     old = [x for x in open(p).read().splitlines() if x] if os.path.exists(p) else [head]
     width = len(head.split(","))
     rows = [head] + [x + "," * (width - len(x.split(","))) for x in old[1:]] + [row]
