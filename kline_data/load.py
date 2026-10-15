@@ -14,3 +14,8 @@ def load(symbol, interval="5m"):
     """Rows of [open_ms, open, high, low, close, volume, close_ms, quote_volume] with numbers converted."""
     rows = json.load(gzip.open(os.path.join(ROOT, f"k_{interval}", symbol + ".json.gz")))
     return [[int(r[0]), *map(float, r[1:6]), int(r[6]), float(r[7])] for r in rows]
+
+
+def load_1h(symbol):
+    """2026 hourly bars from data/k_1h_2026: rows of [open_ms, open, high, low, close, quote_volume]."""
+    return json.load(gzip.open(os.path.join(ROOT, "k_1h_2026", symbol + ".json.gz")))
