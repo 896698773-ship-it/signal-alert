@@ -511,6 +511,7 @@ def f_lines(meta, now_ms, last_open, eq):
     out, nxt = [], last_open + HOUR
     if not f_in_win(nxt) and not any(f_in_win(nxt - k * HOUR) for k in range(1, 25)):
         return out
+    eq = last_value("FW_eq", eq)  # sizes follow the F account (compounding), as of the last daily record
     with ThreadPoolExecutor(max_workers=8) as pool:
         data = list(pool.map(fetch, list(meta)))
     for sym, (t, a) in data:
