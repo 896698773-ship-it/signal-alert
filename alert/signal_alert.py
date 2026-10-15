@@ -12,8 +12,14 @@ Rules (unchanged from the backtests; nothing added):
            >= the previous close; the best score (|previous RSI - 50| + volume ratio capped at 10) is taken;
            entry next open; stop 2 ATR14; trailing 5 ATR14 from closes; at most 4 h; one position at a time;
            skipped when size, margin or liquidation limits fail.
+  F      : record only. On each closed 1h bar: any coin whose close is >= 25% above the close 24 h earlier for the
+           first time (the previous hour was below) with 24h quote volume >= 10M -> short at the next 1h open;
+           stop entry + 2 ATR14(1h); exit 24 h after entry; one trade per coin at a time. Adds: when an hourly close
+           is at least 0.5 x the stop distance below the last entry, add one more unit at the next open (at most 5);
+           after each add the stop of the whole position moves so the loss at the stop is at most the first unit's risk.
 C and D positions are replayed from recent bars on every cycle (the replay keeps their one-position rule
-and trailing stops), so an exit notice is also sent when their stop is hit or their time is up.
+and trailing stops), so an exit notice is also sent when their stop is hit or their time is up. F is replayed
+from the last 99 hourly bars at every hour close.
 
 Each cycle checks only the last CLOSED 5m bar, so a signal is sent once.
 
@@ -409,11 +415,117 @@ def one_pass(meta, last_done):
         lines += [fmt_exit("C", p, ex, bar) for p, ex in c_events if not (ex and ex[0] == "time")]
         if c_pending:
             lines.append(fmt_entry("C", c_pending, bar, eq, rc, meta, 3, 24, "跌破前 6 小时最低价"))
+    if (bar + 300_000) % HOUR == 0:  # the last 5m bar of an hour: that 1h bar has closed too
+        lines += f_lines(meta, now_ms, bar + 300_000 - HOUR, eq)
     if lines:
         send(f"⏰ {bj(bar)} 收盘信号（BTC 4h {'跌' if btc_down else '涨'}）\n\n" + "\n\n".join(lines))
     else:
         print(bj(bar), "no signal")
     return bar
+
+
+# ---------------------------------------------------------------- F (record only)
+F_X, F_ADDS, F_STEP, F_RISK = 0.25, 5, 0.5, 0.01
+HOUR = 3_600_000
+
+
+def hourly_klines(sym, now_ms, limit=99):
+    k = get("/klines", symbol=sym, interval="1h", limit=limit)
+    k = [x for x in k if x[6] < now_ms]
+    a = np.array([[float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[7])] for x in k])
+    return [int(x[0]) for x in k], a
+
+
+def f_trades(a, listed=False):
+    """F on one coin's closed 1h bars (rows open, high, low, close, quote volume). Each trade: signal bar i, entry bar
+    e (None = signal on the last bar, entry at the next open), first-unit stop distance D, units [(price, bar)],
+    current stop, exit (bar, price, why) or None while open, pend = an add is due at the next open, R when closed.
+    listed = the first row is the coin's first hour, so a signal 24 h after listing counts as a first crossing."""
+    out, busy = [], -1
+    if len(a) < 25:
+        return out
+    o, h, l, c, qv = a.T
+    n = len(c)
+    for i in range(24 if listed else 25, n):
+        before = i >= 25 and c[i - 1] / c[i - 25] - 1 >= F_X
+        if not (c[i] / c[i - 24] - 1 >= F_X and not before and qv[i - 23:i + 1].sum() >= 10e6):
+            continue
+        if i + 1 <= busy:
+            continue
+        hi, lo, pc = h[i - 13:i + 1], l[i - 13:i + 1], c[i - 14:i]
+        D = 2 * float(np.mean(np.maximum(hi - lo, np.maximum(np.abs(hi - pc), np.abs(lo - pc)))))
+        if not D > 0:
+            continue
+        if i + 1 >= n:
+            out.append(dict(i=i, e=None, D=D, ref=c[i], r24=c[i] / c[i - 24] - 1))
+            break
+        e = i + 1
+        bx = n  # the coin stays busy until the first unit alone would have exited (stop, gap or 24 h), as tested
+        for j in range(e, min(n, e + 24)):
+            if (j > e and o[j] >= o[e] + D) or h[j] >= o[e] + D or j == e + 23:
+                bx = j
+                break
+        x = dict(i=i, e=e, D=D, units=[(o[e], e)], stop=o[e] + D, exit=None, pend=False)
+        for j in range(e, min(n, e + 24)):
+            if x["pend"] and o[j] < x["stop"]:
+                x["units"].append((o[j], j))
+                x["stop"] = min(x["stop"], (sum(p for p, _ in x["units"]) + D) / len(x["units"]))
+            x["pend"] = False
+            if j > e and o[j] >= x["stop"]:
+                x["exit"] = (j, o[j], "gap")
+            elif h[j] >= x["stop"]:
+                x["exit"] = (j, x["stop"], "stop")
+            elif j == e + 23:
+                x["exit"] = (j, c[j], "time")
+            elif len(x["units"]) - 1 < F_ADDS and c[j] <= x["units"][-1][0] - F_STEP * D:
+                x["pend"] = True
+            if x["exit"]:
+                break
+        if x["exit"]:
+            ent, px = o[e], x["exit"][1]
+            x["R"] = sum((p - px) / ent - FEE * (p + px) / ent for p, _ in x["units"]) / (D / ent + 2 * FEE)
+        busy = bx
+        out.append(x)
+    return out
+
+
+def f_lines(meta, now_ms, last_open, eq):
+    """Telegram lines for F events on the 1h bar that opened at last_open (entries, adds due, exits)."""
+    def fetch(sym):
+        try:
+            return sym, hourly_klines(sym, now_ms)
+        except Exception:  # noqa: BLE001
+            return sym, ([], None)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        data = list(pool.map(fetch, list(meta)))
+    out, nxt = [], last_open + HOUR
+    for sym, (t, a) in data:
+        if not t or t[-1] != last_open:
+            continue
+        n = len(t)
+        for x in f_trades(a, listed=n < 90):
+            if x["e"] is None:
+                ref, D = x["ref"], x["D"]
+                out.append(f"🟣F做空 {sym}（24h 涨 {x['r24'] * 100:.0f}% 后做空，只记录，先不下单）\n"
+                           f"📌 入场：下一根 1 小时开盘市价（{bj(nxt)}），参考价 {ref:.6g}\n"
+                           f"🛑 止损：成交价 + 2×ATR(1h)，约 {ref + D:.6g}（{D / ref * 100:.1f}%）\n"
+                           f"➕ 加仓：1 小时收盘价比上次入场再低 {F_STEP}×止损距离（约 {F_STEP * D / ref * 100:.1f}%）时，"
+                           f"下一根开盘再空 1 份，最多 {F_ADDS} 次；每次加仓后整体止损下移，打止损最多亏第 1 份的风险\n"
+                           f"⏱ {bj(nxt + 24 * HOUR)} 市价平仓\n"
+                           f"{eq:.0f}U 风险 {eq * F_RISK:.1f}U → 每份仓位约 {eq * F_RISK / (D / ref + 2 * FEE):.0f}U")
+            elif x["exit"] and x["exit"][0] == n - 1:
+                j, px, why = x["exit"]
+                what = {"stop": "碰到止损" + ("（已随加仓下移）" if len(x["units"]) > 1 else ""), "gap": "开盘跳空穿过止损",
+                        "time": f"到 24 小时，{bj(nxt)} 开盘市价平仓"}[why]
+                out.append(f"📤 F 平仓提醒 {sym}（{bj(t[x['e']])} 入场，加仓 {len(x['units']) - 1} 次）：{what}，约 {px:.6g}，"
+                           f"结果 {x['R']:+.2f}R")
+            elif x["exit"] is None and x["pend"]:
+                k, ref = len(x["units"]), a[-1, 3]
+                new = min(x["stop"], (sum(p for p, _ in x["units"]) + ref + x["D"]) / (k + 1))
+                out.append(f"🟣F 加仓提醒 {sym}（第 {k} 次，只记录）：下一根 1 小时开盘（{bj(nxt)}）再空 1 份，参考价 {ref:.6g}；"
+                           f"加仓后整体止损移到约 {new:.6g}")
+    return out
 
 
 # ---------------------------------------------------------------- daily record
@@ -503,6 +615,24 @@ def daily_summary(meta, d0):
         q = d_open(meta[x["sym"]], x["side"], x["atr_i"], x["med12"], x["px_open"], eq_a, R_AGGR, CAP_AGGR) if eq_a >= 5 else None
         if q:
             eq_a += q["qty"] * (x["sg"] * (x["px"] - q["fill"]) - FEE * (q["fill"] + x["px"]))
+    hlimit = min(499, int((now - d0) / HOUR) + 70)  # 24 h of trade + 24 h change + ATR before the day
+
+    def fetch_h(sym):
+        time.sleep(0.8)
+        try:
+            return sym, hourly_klines(sym, now, limit=hlimit)
+        except Exception:  # noqa: BLE001
+            return sym, ([], None)
+
+    F = []
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for sym, (t, a) in pool.map(fetch_h, list(meta)):
+            for x in f_trades(a, listed=len(t) < hlimit - 5) if t else []:
+                if x["e"] is not None and x["exit"] and d0 <= t[x["exit"][0]] < d1:
+                    F.append(dict(sym=sym, t=t[x["e"]], R=x["R"], adds=len(x["units"]) - 1, exit_t=t[x["exit"][0]]))
+    f0 = eq_f = last_value("F_eq", 100.0)  # F: its own 100U account, 1% risk per trade, compounding
+    for x in sorted(F, key=lambda x: x["exit_t"]):
+        eq_f *= 1 + F_RISK * x["R"]
 
     def block(name, L, unit):
         if not L:
@@ -527,10 +657,14 @@ def daily_summary(meta, d0):
             + f"🔥 D 的 GPT 激进版（目标每笔止损亏 {R_AGGR * 100:.0f}%，独立 100U 账户，和 30% 方案分开）："
             + f"当天 {eq_a - a0:+.1f}U，{a0:.1f}U → {eq_a:.1f}U\n"
             + f"🔥 E 做多激进版（目标每笔止损亏 {R_AGGR * 100:.0f}%，一次一笔，独立 100U 账户）：当天 {eq_e - e0:+.1f}U，{e0:.1f}U → {eq_e:.1f}U"
-            + (f"\n持仓中：{'；'.join(opened)}" if opened else ""))
+            + (f"\n持仓中：{'；'.join(opened)}" if opened else "")
+            + f"\n\n🟣 F 暴涨做空（只记录，含加仓，每笔风险 1%，独立 100U 账户）：{f0:.1f}U → {eq_f:.1f}U\n"
+            + block("F", F, f0 * F_RISK)
+            + "".join(f"（{x['sym']} 加仓 {x['adds']} 次）" for x in sorted(F, key=lambda x: x["t"]) if x["adds"]))
     row = ",".join([day, str(len(el)), f"{sum(x['R'] for x in el):.3f}", str(len(C)), f"{sum(x['R'] for x in C):.3f}",
                     str(len(D)), f"{sum(x['R'] for x in D):.3f}", f"{u:.2f}", f"{prev + u:.2f}", str(len(es)),
-                    f"{sum(x['R'] for x in es):.3f}", f"{eq_a:.2f}", f"{eq_e:.2f}"])
+                    f"{sum(x['R'] for x in es):.3f}", f"{eq_a:.2f}", f"{eq_e:.2f}", str(len(F)),
+                    f"{sum(x['R'] for x in F):.3f}", f"{eq_f:.2f}"])
     return day, text, row
 
 
@@ -551,7 +685,7 @@ def maybe_daily(meta, state):
     send(text)
     state["done"] = day
     os.makedirs(REC, exist_ok=True)
-    head = "date,E_long_n,E_long_R,C_n,C_R,D_n,D_R,day_U,cum_U,E_short_n,E_short_R,D_aggr_eq,E_aggr_eq"
+    head = "date,E_long_n,E_long_R,C_n,C_R,D_n,D_R,day_U,cum_U,E_short_n,E_short_R,D_aggr_eq,E_aggr_eq,F_n,F_R,F_eq"
     old = [x for x in open(p).read().splitlines() if x] if os.path.exists(p) else [head]
     width = len(head.split(","))
     rows = [head] + [x + "," * (width - len(x.split(","))) for x in old[1:]] + [row]
@@ -573,7 +707,7 @@ def main():
         send(f"⚠️ 提醒脚本连不上币安：{e}")
         raise
     if os.environ.get("HEARTBEAT", "1") == "1":
-        send(f"✅ C+D+E 信号监控已启动，持续约 {duration // 3600} 小时，每 5 分钟检查一次（{len(meta)} 个币）")
+        send(f"✅ C+D+E 信号监控已启动（F 只记录），持续约 {duration // 3600} 小时，每 5 分钟检查一次（{len(meta)} 个币）")
     last, errors, daily = None, 0, {}
     while True:
         try:
