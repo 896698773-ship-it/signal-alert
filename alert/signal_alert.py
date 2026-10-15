@@ -660,7 +660,8 @@ def daily_summary(meta, d0):
             + (f"\n持仓中：{'；'.join(opened)}" if opened else "")
             + f"\n\n🟣 F 暴涨做空（只记录，含加仓，每笔风险 1%，独立 100U 账户）：{f0:.1f}U → {eq_f:.1f}U\n"
             + block("F", F, f0 * F_RISK)
-            + "".join(f"（{x['sym']} 加仓 {x['adds']} 次）" for x in sorted(F, key=lambda x: x["t"]) if x["adds"]))
+            + ("\n  加仓：" + "，".join(f"{x['sym']} {x['adds']} 次" for x in sorted(F, key=lambda x: x["t"]) if x["adds"])
+               if any(x["adds"] for x in F) else ""))
     row = ",".join([day, str(len(el)), f"{sum(x['R'] for x in el):.3f}", str(len(C)), f"{sum(x['R'] for x in C):.3f}",
                     str(len(D)), f"{sum(x['R'] for x in D):.3f}", f"{u:.2f}", f"{prev + u:.2f}", str(len(es)),
                     f"{sum(x['R'] for x in es):.3f}", f"{eq_a:.2f}", f"{eq_e:.2f}", str(len(F)),
