@@ -429,6 +429,7 @@ def one_pass(meta, last_done):
 # ---------------------------------------------------------------- F (record only)
 F_X, F_ADDS, F_STEP, F_RISK = 0.25, 5, 0.5, 0.01
 F_WIN, F_WIN_RISK = (8, 12), 0.10  # pushed F: weekday entries 08:00-11:59 BJT, no adds, 10% risk per trade
+D_WIN_RISK = 0.05  # D entered in the same weekday window, tracked apart (record only)
 
 
 def f_in_win(ms):
@@ -648,6 +649,10 @@ def daily_summary(meta, d0):
     f0 = eq_f = last_value("F_eq", 100.0)  # F: its own 100U account, 1% risk per trade, compounding
     for x in sorted(F, key=lambda x: x["exit_t"]):
         eq_f *= 1 + F_RISK * x["R"]
+    DW = [x for x in D if f_in_win(x["t"])]  # D entered on a weekday 08:00-11:59 BJT (record only)
+    dw0 = eq_dw = last_value("DW_eq", 100.0)
+    for x in sorted(DW, key=lambda x: x["t"]):
+        eq_dw = max(0.0, eq_dw * (1 + D_WIN_RISK * x["R"]))
     W0 = [x for x in F0 if x["win"] and x["wd"]]  # the pushed F: weekday 08-12 entries, no adds
     WE = [x for x in F0 if x["win"] and not x["wd"]]  # weekend 08-12, for comparison only
     w0 = eq_w = last_value("FW_eq", 100.0)
@@ -672,6 +677,8 @@ def daily_summary(meta, d0):
     opened = [f"{m} {x['sym']}（{bj(x['entry_t'])} 入场）" for m, x in (("D", dpos), ("C", cpos)) if x]
     text = (f"📊 昨日战绩 {day}（当天平仓的单，按推送的仓位：{eq:.0f}U，每笔风险 {eq * rl:.0f}U）\n\n"
             + "\n".join([block("E做多", el, eq * rl), block("C做空ETH", C, eq * rc), block("D", D, eq * rd)])
+            + f"\n  D 其中工作日 08-12 点（只记录）：{len(DW)} 笔 {sum(x['R'] for x in DW):+.2f}R，"
+            + f"独立 100U 账户每笔 {D_WIN_RISK * 100:.0f}%：{dw0:.1f}U → {eq_dw:.1f}U"
             + f"\n\n合计 {u:+.1f}U；累计 {prev + u:+.1f}U（{eq:.0f}U → {eq + prev + u:.1f}U）\n"
             + f"{block('E做空（只记录）', es, eq * rs).splitlines()[0]}\n"
             + f"🔥 D 的 GPT 激进版（目标每笔止损亏 {R_AGGR * 100:.0f}%，独立 100U 账户，和 30% 方案分开）："
@@ -686,7 +693,8 @@ def daily_summary(meta, d0):
                     str(len(D)), f"{sum(x['R'] for x in D):.3f}", f"{u:.2f}", f"{prev + u:.2f}", str(len(es)),
                     f"{sum(x['R'] for x in es):.3f}", f"{eq_a:.2f}", f"{eq_e:.2f}", str(len(F)),
                     f"{sum(x['R'] for x in F):.3f}", f"{eq_f:.2f}", str(len(W0)), f"{sum(x['R'] for x in W0):.3f}",
-                    f"{eq_w:.2f}", f"{sum(x['R'] for x in WE):.3f}"])
+                    f"{eq_w:.2f}", f"{sum(x['R'] for x in WE):.3f}", str(len(DW)), f"{sum(x['R'] for x in DW):.3f}",
+                    f"{eq_dw:.2f}"])
     return day, text, row
 
 
@@ -707,7 +715,7 @@ def maybe_daily(meta, state):
     send(text)
     state["done"] = day
     os.makedirs(REC, exist_ok=True)
-    head = "date,E_long_n,E_long_R,C_n,C_R,D_n,D_R,day_U,cum_U,E_short_n,E_short_R,D_aggr_eq,E_aggr_eq,F_n,F_R,F_eq,FW_n,FW_R,FW_eq,FW_weekend_R"
+    head = "date,E_long_n,E_long_R,C_n,C_R,D_n,D_R,day_U,cum_U,E_short_n,E_short_R,D_aggr_eq,E_aggr_eq,F_n,F_R,F_eq,FW_n,FW_R,FW_eq,FW_weekend_R,DW_n,DW_R,DW_eq"
     old = [x for x in open(p).read().splitlines() if x] if os.path.exists(p) else [head]
     width = len(head.split(","))
     rows = [head] + [x + "," * (width - len(x.split(","))) for x in old[1:]] + [row]
