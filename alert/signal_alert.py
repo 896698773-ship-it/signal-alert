@@ -500,6 +500,29 @@ def f_trades(a, listed=False, adds=None):
     return out
 
 
+def f_tp_R(a, x, tps=((2, 0.5), (4, 0.5))):
+    """R of an F trade (no adds) taking profit in stages: half at 2R (then the stop moves to entry), the rest at 4R;
+    otherwise stop or 24 h. None while unfinished. If stop and target fall in the same hour, the stop counts first."""
+    o, h, l, c = a[:, 0], a[:, 1], a[:, 2], a[:, 3]
+    e, D = x["e"], x["D"]
+    ent = o[e]; unit = D / ent + 2 * FEE; stop, left, pnl, k = ent + D, 1.0, 0.0, 0
+    leg = lambda f, px: f * ((ent - px) / ent - FEE * (ent + px) / ent)
+    for j in range(e, min(len(o), e + 24)):
+        if j > e and o[j] >= stop:
+            return (pnl + leg(left, o[j])) / unit
+        if h[j] >= stop:
+            return (pnl + leg(left, stop)) / unit
+        while k < len(tps) and l[j] <= ent - tps[k][0] * D:
+            f = min(left, tps[k][1]); pnl += leg(f, ent - tps[k][0] * D); left -= f; k += 1
+            if k == 1:
+                stop = ent
+        if left <= 1e-9:
+            return pnl / unit
+        if j == e + 23:
+            return (pnl + leg(left, c[j])) / unit
+    return None
+
+
 def f_label(ms):
     """None for the main window (weekday 08:00-11:59 BJT); otherwise a short tag for record-only F pushes."""
     d = datetime.fromtimestamp(ms / 1000, BJT)
@@ -535,6 +558,9 @@ def f_lines(meta, now_ms, last_open, eq):
                 body = (f"📌 入场：下一根 1 小时开盘市价（{bj(nxt)}），参考价 {ref:.6g}\n"
                         f"🛑 止损：成交价 + 2×ATR(1h)，约 {ref + D:.6g}（{D / ref * 100:.1f}%）\n"
                         f"⏱ {bj(nxt + 24 * HOUR)} 市价平仓（没碰止损的话）")
+                if tag is None:
+                    body += (f"\n🎯 止盈参考（可选，按成交价重算）：第一阶段 2R 约 {ref - 2 * D:.6g} 平一半，之后止损移到入场价保本；"
+                             f"第二阶段 4R 约 {ref - 4 * D:.6g} 平剩下")
                 if tag is None:
                     m = meta.get(sym, {})
                     notional = eq * F_WIN_RISK / (D / ref + 2 * FEE)
@@ -659,6 +685,7 @@ def daily_summary(meta, d0):
                 for x in f_trades(a, listed=len(t) < hlimit - 5, adds=adds) if t else []:
                     if x["e"] is not None and x["exit"] and d0 <= t[x["exit"][0]] < d1:
                         L_.append(dict(sym=sym, t=t[x["e"]], R=x["R"], adds=len(x["units"]) - 1, exit_t=t[x["exit"][0]],
+                                       Rtp=f_tp_R(a, x) if adds == 0 else None,
                                        win=F_WIN[0] <= datetime.fromtimestamp(t[x["e"]] / 1000, BJT).hour < F_WIN[1],
                                        wd=datetime.fromtimestamp(t[x["e"]] / 1000, BJT).weekday() < 5))
     f0 = eq_f = last_value("F_eq", 100.0)  # F: its own 100U account, 1% risk per trade, compounding
@@ -674,6 +701,10 @@ def daily_summary(meta, d0):
     k0 = eq_k = last_value("FWE_eq", 100.0)
     for x in sorted(WK, key=lambda x: x["exit_t"]):
         eq_k = max(0.0, eq_k * (1 + F_WIN_RISK * x["R"]))
+    TP = [x for x in W0 if x["Rtp"] is not None]  # same entries, staged take-profit (comparison)
+    tp0 = eq_tp = last_value("FTP_eq", 100.0)
+    for x in sorted(TP, key=lambda x: x["exit_t"]):
+        eq_tp = max(0.0, eq_tp * (1 + F_WIN_RISK * x["Rtp"]))
     w0 = eq_w = last_value("FW_eq", 100.0)
     for x in sorted(W0, key=lambda x: x["exit_t"]):
         eq_w = max(0.0, eq_w * (1 + F_WIN_RISK * x["R"]))
@@ -706,6 +737,8 @@ def daily_summary(meta, d0):
             + (f"\n持仓中：{'；'.join(opened)}" if opened else "")
             + f"\n\n🟣 F 工作日 08-12 点（推送版，不加仓，每笔风险 {F_WIN_RISK * 100:.0f}%，独立 100U 账户）：{w0:.1f}U → {eq_w:.1f}U\n"
             + block("F", W0, w0 * F_WIN_RISK)
+            + f"\n止盈版对照（同样这些单，2R 平一半后保本、4R 平剩下，每笔 {F_WIN_RISK * 100:.0f}%）：{len(TP)} 笔 "
+            + f"{sum(x['Rtp'] for x in TP):+.2f}R，{tp0:.1f}U → {eq_tp:.1f}U"
             + f"\n对照（只记录）：周末 08-12 点 {len(WE)} 笔 {sum(x['R'] for x in WE):+.2f}R；"
             + f"F 全天不加仓（推送里的🔵单也在内）{len(F0)} 笔 {sum(x['R'] for x in F0):+.2f}R；"
             + f"F 全天含加仓 {len(F)} 笔 {sum(x['R'] for x in F):+.2f}R（1% 账户 {f0:.1f}U → {eq_f:.1f}U）"
@@ -717,7 +750,7 @@ def daily_summary(meta, d0):
                     f"{sum(x['R'] for x in es):.3f}", f"{eq_a:.2f}", f"{eq_e:.2f}", str(len(F)),
                     f"{sum(x['R'] for x in F):.3f}", f"{eq_f:.2f}", str(len(W0)), f"{sum(x['R'] for x in W0):.3f}",
                     f"{eq_w:.2f}", f"{sum(x['R'] for x in WE):.3f}", str(len(DW)), f"{sum(x['R'] for x in DW):.3f}",
-                    f"{eq_dw:.2f}", str(len(WK)), f"{sum(x['R'] for x in WK):.3f}", f"{eq_k:.2f}"])
+                    f"{eq_dw:.2f}", str(len(WK)), f"{sum(x['R'] for x in WK):.3f}", f"{eq_k:.2f}", f"{sum(x['Rtp'] for x in TP):.3f}", f"{eq_tp:.2f}"])
     return day, text, row
 
 
@@ -738,7 +771,7 @@ def maybe_daily(meta, state):
     send(text)
     state["done"] = day
     os.makedirs(REC, exist_ok=True)
-    head = "date,E_long_n,E_long_R,C_n,C_R,D_n,D_R,day_U,cum_U,E_short_n,E_short_R,D_aggr_eq,E_aggr_eq,F_n,F_R,F_eq,FW_n,FW_R,FW_eq,FW_weekend_R,DW_n,DW_R,DW_eq,FWE_n,FWE_R,FWE_eq"
+    head = "date,E_long_n,E_long_R,C_n,C_R,D_n,D_R,day_U,cum_U,E_short_n,E_short_R,D_aggr_eq,E_aggr_eq,F_n,F_R,F_eq,FW_n,FW_R,FW_eq,FW_weekend_R,DW_n,DW_R,DW_eq,FWE_n,FWE_R,FWE_eq,FTP_R,FTP_eq"
     old = [x for x in open(p).read().splitlines() if x] if os.path.exists(p) else [head]
     width = len(head.split(","))
     rows = [head] + [x + "," * (width - len(x.split(","))) for x in old[1:]] + [row]
