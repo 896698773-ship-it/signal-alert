@@ -17,8 +17,8 @@ Rules (unchanged from the backtests; nothing added):
            stop entry + 2 ATR14(1h); exit 24 h after entry; one trade per coin at a time. Adds: when an hourly close
            is at least 0.5 x the stop distance below the last entry, add one more unit at the next open (at most 5);
            after each add the stop of the whole position moves so the loss at the stop is at most the first unit's risk.
-           Pushed: only entries on weekdays 08:00-11:59 BJT, without adds, at F_WIN_RISK (10%) per trade; the
-           full F (all hours, adds, 1%) stays in the daily record for comparison.
+           Pushed without adds: weekday 08:00-11:59 BJT entries are the main ones, sized at F_WIN_RISK (10%);
+           entries at other hours are pushed with a record-only tag; the daily record compares them.
 C and D positions are replayed from recent bars on every cycle (the replay keeps their one-position rule
 and trailing stops), so an exit notice is also sent when their stop is hit or their time is up. F is replayed
 from the last 99 hourly bars at every hour close.
@@ -500,9 +500,21 @@ def f_trades(a, listed=False, adds=None):
     return out
 
 
+def f_label(ms):
+    """None for the main window (weekday 08:00-11:59 BJT); otherwise a short tag for record-only F pushes."""
+    d = datetime.fromtimestamp(ms / 1000, BJT)
+    if f_in_win(ms):
+        return None
+    if d.weekday() >= 5 and 14 <= d.hour < 18:
+        return "对照：周末 14-18 点，回测 10 个月 8 个月赚"
+    if d.hour >= 21 or d.hour < 5:
+        return "注意：美洲盘 21-05 点，回测全年 -90R，最差时段"
+    return "非主力时段"
+
+
 def f_lines(meta, now_ms, last_open, eq):
-    """Telegram lines for F on the 1h bar that opened at last_open: entries due at the next open on a weekday
-    08:00-11:59 BJT (no adds, F_WIN_RISK per trade), and the exits of such trades."""
+    """Telegram lines for F (no adds) on the 1h bar that opened at last_open. Weekday 08:00-11:59 BJT entries are the
+    main ones (sized at F_WIN_RISK); entries at other hours are pushed with a record-only tag and no size."""
     def fetch(sym):
         try:
             return sym, hourly_klines(sym, now_ms)
@@ -510,8 +522,6 @@ def f_lines(meta, now_ms, last_open, eq):
             return sym, ([], None)
 
     out, nxt = [], last_open + HOUR
-    if not f_in_win(nxt) and not any(f_in_win(nxt - k * HOUR) for k in range(1, 25)):
-        return out
     eq = last_value("FW_eq", eq)  # sizes follow the F account (compounding), as of the last daily record
     with ThreadPoolExecutor(max_workers=8) as pool:
         data = list(pool.map(fetch, list(meta)))
@@ -521,23 +531,28 @@ def f_lines(meta, now_ms, last_open, eq):
         n = len(t)
         for x in f_trades(a, listed=n < 90, adds=0):
             if x["e"] is None:
-                if not f_in_win(nxt):
-                    continue
-                ref, D = x["ref"], x["D"]
-                m = meta.get(sym, {})
-                notional = eq * F_WIN_RISK / (D / ref + 2 * FEE)
-                lev = safe_lev(ref, ref + D, "short", m.get("L", 20), m.get("mmr", 0.01))
-                out.append(f"🟣F做空 {sym}（工作日 08-12 点，24h 涨 {x['r24'] * 100:.0f}% 后做空，不加仓）\n"
-                           f"📌 入场：下一根 1 小时开盘市价（{bj(nxt)}），参考价 {ref:.6g}\n"
-                           f"🛑 止损：成交价 + 2×ATR(1h)，约 {ref + D:.6g}（{D / ref * 100:.1f}%）\n"
-                           f"⏱ {bj(nxt + 24 * HOUR)} 市价平仓（没碰止损的话）\n"
-                           f"{eq:.0f}U 风险 {eq * F_WIN_RISK:.0f}U（每笔 {F_WIN_RISK * 100:.0f}%）→ 仓位约 {notional:.0f}U，"
-                           f"杠杆 ≤{lev}x，保证金约 {notional / lev:.1f}U")
-            elif x["exit"] and x["exit"][0] == n - 1 and f_in_win(t[x["e"]]):
+                ref, D, tag = x["ref"], x["D"], f_label(nxt)
+                body = (f"📌 入场：下一根 1 小时开盘市价（{bj(nxt)}），参考价 {ref:.6g}\n"
+                        f"🛑 止损：成交价 + 2×ATR(1h)，约 {ref + D:.6g}（{D / ref * 100:.1f}%）\n"
+                        f"⏱ {bj(nxt + 24 * HOUR)} 市价平仓（没碰止损的话）")
+                if tag is None:
+                    m = meta.get(sym, {})
+                    notional = eq * F_WIN_RISK / (D / ref + 2 * FEE)
+                    lev = safe_lev(ref, ref + D, "short", m.get("L", 20), m.get("mmr", 0.01))
+                    out.append(f"🟣F做空 {sym}（主力：工作日 08-12 点，24h 涨 {x['r24'] * 100:.0f}% 后做空，不加仓）\n" + body + "\n"
+                               f"{eq:.0f}U 风险 {eq * F_WIN_RISK:.0f}U（每笔 {F_WIN_RISK * 100:.0f}%）→ 仓位约 {notional:.0f}U，"
+                               f"杠杆 ≤{lev}x，保证金约 {notional / lev:.1f}U")
+                else:
+                    out.append(f"🔵F做空 {sym}【{tag}，仅记录】（24h 涨 {x['r24'] * 100:.0f}% 后做空，不加仓）\n" + body)
+            elif x["exit"] and x["exit"][0] == n - 1:
                 j, px, why = x["exit"]
+                tag = f_label(t[x["e"]])
                 what = {"stop": "碰到止损", "gap": "开盘跳空穿过止损", "time": f"到 24 小时，{bj(nxt)} 开盘市价平仓"}[why]
-                out.append(f"📤 F 平仓提醒 {sym}（{bj(t[x['e']])} 入场）：{what}，约 {px:.6g}，结果 {x['R']:+.2f}R"
-                           f"（{eq:.0f}U 账户约 {x['R'] * eq * F_WIN_RISK:+.1f}U）")
+                if tag is None:
+                    out.append(f"📤 F 平仓提醒 {sym}（主力，{bj(t[x['e']])} 入场）：{what}，约 {px:.6g}，结果 {x['R']:+.2f}R"
+                               f"（{eq:.0f}U 账户约 {x['R'] * eq * F_WIN_RISK:+.1f}U）")
+                else:
+                    out.append(f"📤 F 平仓 {sym}【{tag}，仅记录】（{bj(t[x['e']])} 入场）：{what}，约 {px:.6g}，结果 {x['R']:+.2f}R")
     return out
 
 
@@ -692,6 +707,7 @@ def daily_summary(meta, d0):
             + f"\n\n🟣 F 工作日 08-12 点（推送版，不加仓，每笔风险 {F_WIN_RISK * 100:.0f}%，独立 100U 账户）：{w0:.1f}U → {eq_w:.1f}U\n"
             + block("F", W0, w0 * F_WIN_RISK)
             + f"\n对照（只记录）：周末 08-12 点 {len(WE)} 笔 {sum(x['R'] for x in WE):+.2f}R；"
+            + f"F 全天不加仓（推送里的🔵单也在内）{len(F0)} 笔 {sum(x['R'] for x in F0):+.2f}R；"
             + f"F 全天含加仓 {len(F)} 笔 {sum(x['R'] for x in F):+.2f}R（1% 账户 {f0:.1f}U → {eq_f:.1f}U）"
             + f"\n对照（只记录）：F 周末 14-18 点（不加仓）{len(WK)} 笔 {sum(x['R'] for x in WK):+.2f}R，"
             + f"独立 100U 账户每笔 {F_WIN_RISK * 100:.0f}%：{k0:.1f}U → {eq_k:.1f}U"
