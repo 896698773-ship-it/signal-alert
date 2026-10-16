@@ -532,8 +532,6 @@ def f_lines(meta, now_ms, last_open, eq):
         for x in f_trades(a, listed=n < 90, adds=0):
             if x["e"] is None:
                 ref, D, tag = x["ref"], x["D"], f_label(nxt)
-                if tag and tag.startswith("注意"):  # US hours 21:00-04:59 BJT: not pushed
-                    continue
                 body = (f"📌 入场：下一根 1 小时开盘市价（{bj(nxt)}），参考价 {ref:.6g}\n"
                         f"🛑 止损：成交价 + 2×ATR(1h)，约 {ref + D:.6g}（{D / ref * 100:.1f}%）\n"
                         f"⏱ {bj(nxt + 24 * HOUR)} 市价平仓（没碰止损的话）")
@@ -549,8 +547,6 @@ def f_lines(meta, now_ms, last_open, eq):
             elif x["exit"] and x["exit"][0] == n - 1:
                 j, px, why = x["exit"]
                 tag = f_label(t[x["e"]])
-                if tag and tag.startswith("注意"):
-                    continue
                 what = {"stop": "碰到止损", "gap": "开盘跳空穿过止损", "time": f"到 24 小时，{bj(nxt)} 开盘市价平仓"}[why]
                 if tag is None:
                     out.append(f"📤 F 平仓提醒 {sym}（主力，{bj(t[x['e']])} 入场）：{what}，约 {px:.6g}，结果 {x['R']:+.2f}R"
