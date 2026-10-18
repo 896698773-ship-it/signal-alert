@@ -750,8 +750,48 @@ def daily_summary(meta, d0):
                     f"{sum(x['R'] for x in es):.3f}", f"{eq_a:.2f}", f"{eq_e:.2f}", str(len(F)),
                     f"{sum(x['R'] for x in F):.3f}", f"{eq_f:.2f}", str(len(W0)), f"{sum(x['R'] for x in W0):.3f}",
                     f"{eq_w:.2f}", f"{sum(x['R'] for x in WE):.3f}", str(len(DW)), f"{sum(x['R'] for x in DW):.3f}",
-                    f"{eq_dw:.2f}", str(len(WK)), f"{sum(x['R'] for x in WK):.3f}", f"{eq_k:.2f}", f"{sum(x['Rtp'] for x in TP):.3f}", f"{eq_tp:.2f}"])
+                    f"{eq_dw:.2f}", str(len(WK)), f"{sum(x['R'] for x in WK):.3f}", f"{eq_k:.2f}", f"{sum(x['Rtp'] for x in TP):.3f}", f"{eq_tp:.2f}", str(len(F0)), f"{sum(x['R'] for x in F0):.3f}"])
     return day, text, row
+
+
+def period_summary(n=None, label="上线以来"):
+    """Totals over the last n daily records (all records when n is None) for every model, from records/daily.csv."""
+    p = os.path.join(REC, "daily.csv")
+    lines = [x for x in open(p).read().splitlines() if x]
+    head = lines[0].split(",")
+    rows = [dict(zip(head, x.split(","))) for x in lines[1:]]
+    sel = rows if n is None else rows[-n:]
+    if not sel:
+        return ""
+    v = lambda r, k: float(r.get(k) or 0)
+    tot = lambda k: sum(v(r, k) for r in sel)
+    cnt = lambda k: int(sum(v(r, k) for r in sel))
+    before = rows[:len(rows) - len(sel)]
+
+    def acct(k):  # balance at the start and end of the period (an account starts at 100U before its first record)
+        a = next((v(r, k) for r in reversed(before) if r.get(k)), 100.0)
+        b = next((v(r, k) for r in reversed(sel) if r.get(k)), a)
+        return f"{a:.1f}U → {b:.1f}U"
+    def since(k):  # columns were added over time; say when a line starts having data
+        d = next((r["date"] for r in sel if r.get(k)), None)
+        return "（暂无记录）" if d is None else ("" if d == sel[0]["date"] else f"（{d} 起有记录）")
+    out = [f"📈 {label}汇总（{sel[0]['date']} ~ {sel[-1]['date']}，{len(sel)} 天，按平仓日，单位 R）", ""]
+    out.append(f"🟣 F 主力（工作日 08-12 点，不加仓，每笔 {F_WIN_RISK * 100:.0f}%）：{cnt('FW_n')} 笔 {tot('FW_R'):+.2f}R，账户 {acct('FW_eq')}"
+               + since("FW_eq"))
+    out.append(f"   止盈版对照（2R 平一半后保本、4R 平剩下）：{tot('FTP_R'):+.2f}R，账户 {acct('FTP_eq')}{since('FTP_eq')}")
+    out.append(f"   F 全天不加仓（含🔵单）：{cnt('F0_n')} 笔 {tot('F0_R'):+.2f}R{since('F0_R')}")
+    out.append(f"   F 全天含加仓（1%）：{cnt('F_n')} 笔 {tot('F_R'):+.2f}R{since('F_R')}")
+    out.append(f"   F 周末 14-18 点：{cnt('FWE_n')} 笔 {tot('FWE_R'):+.2f}R{since('FWE_R')}；周末 08-12 点：{tot('FW_weekend_R'):+.2f}R")
+    out.append(f"E 做多：{cnt('E_long_n')} 笔 {tot('E_long_R'):+.2f}R")
+    out.append(f"E 做空（只记录）：{cnt('E_short_n')} 笔 {tot('E_short_R'):+.2f}R")
+    out.append(f"C 做空 ETH：{cnt('C_n')} 笔 {tot('C_R'):+.2f}R")
+    out.append(f"D：{cnt('D_n')} 笔 {tot('D_R'):+.2f}R（其中工作日 08-12 点 {cnt('DW_n')} 笔 {tot('DW_R'):+.2f}R{since('DW_R')}）")
+    out.append(f"C+D+E 按推送仓位（每笔 6U）：{tot('day_U'):+.1f}U")
+    fd = [r for r in sel if r.get("FW_R")]
+    if fd:
+        best = max(fd, key=lambda r: v(r, "FW_R")); worst = min(fd, key=lambda r: v(r, "FW_R"))
+        out.append(f"F 主力最好的一天 {best['date']} {v(best, 'FW_R'):+.2f}R，最差的一天 {worst['date']} {v(worst, 'FW_R'):+.2f}R")
+    return "\n".join(out)
 
 
 def maybe_daily(meta, state):
@@ -771,7 +811,7 @@ def maybe_daily(meta, state):
     send(text)
     state["done"] = day
     os.makedirs(REC, exist_ok=True)
-    head = "date,E_long_n,E_long_R,C_n,C_R,D_n,D_R,day_U,cum_U,E_short_n,E_short_R,D_aggr_eq,E_aggr_eq,F_n,F_R,F_eq,FW_n,FW_R,FW_eq,FW_weekend_R,DW_n,DW_R,DW_eq,FWE_n,FWE_R,FWE_eq,FTP_R,FTP_eq"
+    head = "date,E_long_n,E_long_R,C_n,C_R,D_n,D_R,day_U,cum_U,E_short_n,E_short_R,D_aggr_eq,E_aggr_eq,F_n,F_R,F_eq,FW_n,FW_R,FW_eq,FW_weekend_R,DW_n,DW_R,DW_eq,FWE_n,FWE_R,FWE_eq,FTP_R,FTP_eq,F0_n,F0_R"
     old = [x for x in open(p).read().splitlines() if x] if os.path.exists(p) else [head]
     width = len(head.split(","))
     rows = [head] + [x + "," * (width - len(x.split(","))) for x in old[1:]] + [row]
@@ -779,6 +819,11 @@ def maybe_daily(meta, state):
         f.write("\n".join(rows) + "\n")
     with open(os.path.join(REC, "daily.md"), "a") as f:
         f.write(text + "\n\n---\n\n")
+    try:  # Monday: last 7 days; 1st and 16th: last 15 days; each followed by the totals since the alerts started
+        for label, n in ([("近 7 天", 7)] if now.weekday() == 0 else []) + ([("近 15 天", 15)] if now.day in (1, 16) else []):
+            send(period_summary(n, label) + "\n\n" + period_summary(None, "上线以来"))
+    except Exception as e:  # noqa: BLE001 - a summary must never block the daily record
+        print("period summary failed:", e)
     if not (git("add", "records") and git("-c", "user.name=signal-alert", "-c", "user.email=signal-alert@users.noreply.github.com",
                                            "commit", "-q", "-m", f"Daily record {day}") and git("push", "-q")):
         print("daily record not pushed")
