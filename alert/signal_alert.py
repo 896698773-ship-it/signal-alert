@@ -701,6 +701,8 @@ def daily_summary(meta, d0):
     k0 = eq_k = last_value("FWE_eq", 100.0)
     for x in sorted(WK, key=lambda x: x["exit_t"]):
         eq_k = max(0.0, eq_k * (1 + F_WIN_RISK * x["R"]))
+    US = [x for x in F0 if (f_label(x["t"]) or "").startswith("注意")]  # 21:00-04:59 BJT, record only
+    OT = [x for x in F0 if f_label(x["t"]) == "非主力时段" and not x["win"]]  # every other non-main hour
     TP = [x for x in W0 if x["Rtp"] is not None]  # same entries, staged take-profit (comparison)
     tp0 = eq_tp = last_value("FTP_eq", 100.0)
     for x in sorted(TP, key=lambda x: x["exit_t"]):
@@ -744,13 +746,17 @@ def daily_summary(meta, d0):
             + f"F 全天含加仓 {len(F)} 笔 {sum(x['R'] for x in F):+.2f}R（1% 账户 {f0:.1f}U → {eq_f:.1f}U）"
             + f"\n对照（只记录）：F 周末 14-18 点（不加仓）{len(WK)} 笔 {sum(x['R'] for x in WK):+.2f}R，"
             + f"独立 100U 账户每笔 {F_WIN_RISK * 100:.0f}%：{k0:.1f}U → {eq_k:.1f}U"
-            + "".join(f"\n  {bj(x['t'])} {x['sym']} {x['R']:+.2f}R" for x in sorted(WK, key=lambda x: x["t"])))
+            + "".join(f"\n  {bj(x['t'])} {x['sym']} {x['R']:+.2f}R" for x in sorted(WK, key=lambda x: x["t"]))
+            + f"\nF 分时段（不加仓，只看 R）：主力 {len(W0)} 笔 {sum(x['R'] for x in W0):+.2f}R；美洲盘 21-05 点 {len(US)} 笔 "
+            + f"{sum(x['R'] for x in US):+.2f}R；周末 14-18 点 {len(WK)} 笔 {sum(x['R'] for x in WK):+.2f}R；周末 08-12 点 {len(WE)} 笔 "
+            + f"{sum(x['R'] for x in WE):+.2f}R；其他时段 {len(OT)} 笔 {sum(x['R'] for x in OT):+.2f}R")
     row = ",".join([day, str(len(el)), f"{sum(x['R'] for x in el):.3f}", str(len(C)), f"{sum(x['R'] for x in C):.3f}",
                     str(len(D)), f"{sum(x['R'] for x in D):.3f}", f"{u:.2f}", f"{prev + u:.2f}", str(len(es)),
                     f"{sum(x['R'] for x in es):.3f}", f"{eq_a:.2f}", f"{eq_e:.2f}", str(len(F)),
                     f"{sum(x['R'] for x in F):.3f}", f"{eq_f:.2f}", str(len(W0)), f"{sum(x['R'] for x in W0):.3f}",
                     f"{eq_w:.2f}", f"{sum(x['R'] for x in WE):.3f}", str(len(DW)), f"{sum(x['R'] for x in DW):.3f}",
-                    f"{eq_dw:.2f}", str(len(WK)), f"{sum(x['R'] for x in WK):.3f}", f"{eq_k:.2f}", f"{sum(x['Rtp'] for x in TP):.3f}", f"{eq_tp:.2f}", str(len(F0)), f"{sum(x['R'] for x in F0):.3f}"])
+                    f"{eq_dw:.2f}", str(len(WK)), f"{sum(x['R'] for x in WK):.3f}", f"{eq_k:.2f}", f"{sum(x['Rtp'] for x in TP):.3f}", f"{eq_tp:.2f}", str(len(F0)), f"{sum(x['R'] for x in F0):.3f}", str(len(US)), f"{sum(x['R'] for x in US):.3f}",
+                    str(len(OT)), f"{sum(x['R'] for x in OT):.3f}"])
     return day, text, row
 
 
@@ -782,6 +788,8 @@ def period_summary(n=None, label="上线以来"):
     out.append(f"   F 全天不加仓（含🔵单）：{cnt('F0_n')} 笔 {tot('F0_R'):+.2f}R{since('F0_R')}")
     out.append(f"   F 全天含加仓（1%）：{cnt('F_n')} 笔 {tot('F_R'):+.2f}R{since('F_R')}")
     out.append(f"   F 周末 14-18 点：{cnt('FWE_n')} 笔 {tot('FWE_R'):+.2f}R{since('FWE_R')}；周末 08-12 点：{tot('FW_weekend_R'):+.2f}R")
+    out.append(f"   F 美洲盘 21-05 点：{cnt('FUS_n')} 笔 {tot('FUS_R'):+.2f}R{since('FUS_R')}；其他时段：{cnt('FOT_n')} 笔 "
+               f"{tot('FOT_R'):+.2f}R{since('FOT_R')}")
     out.append(f"E 做多：{cnt('E_long_n')} 笔 {tot('E_long_R'):+.2f}R")
     out.append(f"E 做空（只记录）：{cnt('E_short_n')} 笔 {tot('E_short_R'):+.2f}R")
     out.append(f"C 做空 ETH：{cnt('C_n')} 笔 {tot('C_R'):+.2f}R")
@@ -811,7 +819,7 @@ def maybe_daily(meta, state):
     send(text)
     state["done"] = day
     os.makedirs(REC, exist_ok=True)
-    head = "date,E_long_n,E_long_R,C_n,C_R,D_n,D_R,day_U,cum_U,E_short_n,E_short_R,D_aggr_eq,E_aggr_eq,F_n,F_R,F_eq,FW_n,FW_R,FW_eq,FW_weekend_R,DW_n,DW_R,DW_eq,FWE_n,FWE_R,FWE_eq,FTP_R,FTP_eq,F0_n,F0_R"
+    head = "date,E_long_n,E_long_R,C_n,C_R,D_n,D_R,day_U,cum_U,E_short_n,E_short_R,D_aggr_eq,E_aggr_eq,F_n,F_R,F_eq,FW_n,FW_R,FW_eq,FW_weekend_R,DW_n,DW_R,DW_eq,FWE_n,FWE_R,FWE_eq,FTP_R,FTP_eq,F0_n,F0_R,FUS_n,FUS_R,FOT_n,FOT_R"
     old = [x for x in open(p).read().splitlines() if x] if os.path.exists(p) else [head]
     width = len(head.split(","))
     rows = [head] + [x + "," * (width - len(x.split(","))) for x in old[1:]] + [row]
