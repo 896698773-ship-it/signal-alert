@@ -1,0 +1,40 @@
+name: football-recorder
+# Data only: snapshots of live Crown / bet365 football prices every 5 minutes, saved to the football-data branch.
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: football-recorder
+  cancel-in-progress: false
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - run: python -u football/recorder.py out
+        env:
+          DURATION: "20400"
+      - name: Save to the football-data branch
+        if: always()
+        run: |
+          git config user.name "football-recorder"
+          git config user.email "football-recorder@users.noreply.github.com"
+          mkdir -p /tmp/fd && cp out/*.csv.gz /tmp/fd/ 2>/dev/null || exit 0
+          if git fetch origin football-data; then
+            git checkout -B football-data origin/football-data
+          else
+            git checkout --orphan football-data
+            git rm -rf --cached . > /dev/null
+          fi
+          mkdir -p data && cp /tmp/fd/*.csv.gz data/
+          git add data
+          git commit -m "football data $(date -u +%Y-%m-%d_%H%M)" || exit 0
+          for i in 1 2 3; do git push origin football-data && break; sleep 10; done
