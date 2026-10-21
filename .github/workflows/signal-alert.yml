@@ -1,14 +1,16 @@
-# Starts a ~6-hour monitoring job every 6 hours (and on manual "Run workflow").
+# Starts a monitoring job every 4 hours (and on manual "Run workflow"). A running job hands over to the next one:
+# once a later run is waiting (or DURATION is up, when it starts the next run itself) it ends just before a 5m close,
+# so there is no gap between jobs.
 # Secret needed (Settings -> Secrets and variables -> Actions): TELEGRAM_TOKEN
 name: signal-alert
 on:
   schedule:
-    - cron: "0 */6 * * *"   # start a 6-hour monitoring job every 6 hours
+    - cron: "0 */4 * * *"   # a new job every 4 hours; it waits until the running one hands over
   workflow_dispatch:         # allows a manual start from the Actions tab
     inputs:
       duration:
-        description: "Seconds to keep running"
-        default: "21000"
+        description: "Most seconds to keep running"
+        default: "19800"
 concurrency:
   group: signal-alert
   cancel-in-progress: false
@@ -18,6 +20,7 @@ jobs:
     timeout-minutes: 360
     permissions:
       contents: write   # the daily record is committed to records/
+      actions: write    # see whether the next run is waiting, or start it
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -34,5 +37,6 @@ jobs:
           RISK_C: "0.06"
           RISK_D: "0.06"
           CAP_D: "0.01"
-          DURATION: ${{ inputs.duration || '21000' }}
+          DURATION: ${{ inputs.duration || '19800' }}
+          GH_TOKEN: ${{ github.token }}
           HEARTBEAT: "1"

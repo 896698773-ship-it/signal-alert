@@ -23,19 +23,27 @@ C and D positions are replayed from recent bars on every cycle (the replay keeps
 and trailing stops), so an exit notice is also sent when their stop is hit or their time is up. F is replayed
 from the last 99 hourly bars at every hour close.
 
-Each cycle checks only the last CLOSED 5m bar, so a signal is sent once.
+Each cycle checks only the last CLOSED 5m bar, so a signal is sent once. A cycle starts a few seconds after each
+5m close; at an hour close F goes first, as its own message, before C/D/E.
 
 Daily record: after 08:00 Beijing time the previous day is replayed with the same rules (every trade that
-closed that day, as pushed), sent as "昨日战绩" and appended to records/daily.csv / daily.md in the repo.
+closed that day, as pushed), sent as "昨日战绩" and appended to records/daily.csv / daily.md in the repo. It runs
+in a background thread, pausing while a cycle runs, so it never makes a cycle skip a bar.
+
+On GitHub Actions one job hands over to the next: when a later run of the workflow is waiting (or DURATION is
+reached, in which case the job starts the next run itself), the job ends just before a 5m close, so the next job's
+first cycle takes that bar.
 
 Environment variables:
   TELEGRAM_TOKEN, TELEGRAM_CHAT_ID  (required to send; without them the message is printed)
   EQUITY (default 100), RISK_LONG (0.02), RISK_SHORT (0.01), RISK_C (0.02), RISK_D (0.02), CAP_D (0.01)
-  DURATION seconds to keep looping (default 0 = one pass), HEARTBEAT (1 = send a start message)
+  DURATION seconds to keep looping at most (default 0 = one pass), HEARTBEAT (1 = send a start message)
+  GH_TOKEN (with GITHUB_REPOSITORY / GITHUB_RUN_ID set by Actions) for the hand-over between jobs
 """
 import math
 import os
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -49,6 +57,9 @@ BJT = timezone(timedelta(hours=8))
 FEE, SLIP = 0.0005, 0.0002
 N, EXT, LB = 48, 0.003, 12
 S = requests.Session()
+WEIGHT = [0, 0.0]  # Binance's used request weight (one-minute window) from the last response, and when it was seen
+PASS = threading.Event()  # set while a 5-minute cycle runs; the daily record waits for it
+WORKFLOW = "signal-alert.yml"
 
 
 def bj(ms):
@@ -61,24 +72,34 @@ def send(text):
         print(text)
         return
     for _ in range(3):
-        try:
-            r = S.post(f"https://api.telegram.org/bot{tok}/sendMessage",
-                       json={"chat_id": chat, "text": text, "disable_web_page_preview": True}, timeout=20)
+        try:  # a new connection each time: a kept-alive one idle for minutes is often dropped silently and only times out
+            r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                              json={"chat_id": chat, "text": text, "disable_web_page_preview": True}, timeout=(5, 15))
             if r.status_code == 200:
-                print("telegram sent:", text[:60].replace("\n", " "), flush=True)
+                print(datetime.now(BJT).strftime("%H:%M:%S"), "telegram sent:", text[:60].replace("\n", " "), flush=True)
                 return
             print("telegram error", r.status_code, r.text[:300], flush=True)
         except requests.RequestException as e:
             print("telegram request failed:", e, flush=True)
-        time.sleep(3)
+        time.sleep(2)
     print("telegram send failed:", text[:200], flush=True)
 
 
 def get(path, **params):
     r = S.get(BASE + path, params=params, timeout=20)
+    w = r.headers.get("x-mbx-used-weight-1m")
+    if w and w.isdigit():
+        WEIGHT[:] = [int(w), time.time()]
     if r.status_code != 200:
         raise RuntimeError(f"binance {path} http {r.status_code}")
     return r.json()
+
+
+def daily_gate():
+    """The daily record shares Binance's one-minute request-weight limit with the cycles: it waits while a cycle runs
+    or while the last seen weight is above 700 (a full cycle with F adds about 1,600 of the 2,400 allowed)."""
+    while PASS.is_set() or (WEIGHT[0] > 700 and time.time() - WEIGHT[1] < 60):
+        time.sleep(1)
 
 
 def universe():
@@ -372,6 +393,11 @@ def one_pass(meta, last_done):
     rc, rd = float(os.environ.get("RISK_C", "0.02")), float(os.environ.get("RISK_D", "0.02"))
     capd = float(os.environ.get("CAP_D", "0.01"))
     lines = []
+    if (bar + 300_000) % HOUR == 0:  # the last 5m bar of an hour: that 1h bar has closed too, F goes out first
+        try:
+            lines += f_first(meta, now_ms, bar, eq)
+        except Exception as e:  # noqa: BLE001 - F must not hold up C/D/E
+            send(f"⚠️ F 检查出错：{e}")
 
     def fetch(sym):
         try:
@@ -417,8 +443,6 @@ def one_pass(meta, last_done):
         lines += [fmt_exit("C", p, ex, bar) for p, ex in c_events if not (ex and ex[0] == "time")]
         if c_pending:
             lines.append(fmt_entry("C", c_pending, bar, eq, rc, meta, 3, 24, "跌破前 6 小时最低价"))
-    if (bar + 300_000) % HOUR == 0:  # the last 5m bar of an hour: that 1h bar has closed too
-        lines += f_lines(meta, now_ms, bar + 300_000 - HOUR, eq)
     if lines:
         send(f"⏰ {bj(bar)} 收盘信号（BTC 4h {'跌' if btc_down else '涨'}）\n\n" + "\n\n".join(lines))
     else:
@@ -535,9 +559,28 @@ def f_label(ms):
     return "非主力时段"
 
 
-def f_lines(meta, now_ms, last_open, eq):
-    """Telegram lines for F (no adds) on the 1h bar that opened at last_open. Weekday 08:00-11:59 BJT entries are the
-    main ones (sized at F_WIN_RISK); entries at other hours are pushed with a record-only tag and no size."""
+def f_first(meta, now_ms, bar, eq):
+    """F at an hour close, ahead of C/D/E. An F entry needs a 25% rise over 24 h, so coins up 15%+ on the 24h ticker
+    are checked first and their lines sent at once as their own message; the other coins (F exits only) are checked
+    next and their lines returned to go out with the 5-minute message."""
+    last_open = bar + 300_000 - HOUR
+    try:
+        hot = sorted(x["symbol"] for x in get("/ticker/24hr")
+                     if x["symbol"] in meta and float(x["priceChangePercent"]) >= 15)
+    except Exception as e:  # noqa: BLE001 - without the ticker every coin goes in the first message
+        print("24h ticker failed:", e)
+        hot = list(meta)
+    first = f_lines(meta, now_ms, last_open, eq, hot)
+    if first:
+        send(f"⏰ {bj(bar + 300_000)} 整点 F 信号（1 小时 K 线刚收盘）\n\n" + "\n\n".join(first))
+    hs = set(hot)
+    return f_lines(meta, now_ms, last_open, eq, [s for s in meta if s not in hs])
+
+
+def f_lines(meta, now_ms, last_open, eq, syms=None):
+    """Telegram lines for F (no adds) on the 1h bar that opened at last_open, for syms (default every coin). Weekday
+    08:00-11:59 BJT entries are the main ones (sized at F_WIN_RISK); entries at other hours are pushed with a
+    record-only tag and no size."""
     def fetch(sym):
         try:
             return sym, hourly_klines(sym, now_ms)
@@ -545,9 +588,11 @@ def f_lines(meta, now_ms, last_open, eq):
             return sym, ([], None)
 
     out, nxt = [], last_open + HOUR
+    if not (syms is None or syms):
+        return out
     eq = last_value("FW_eq", eq)  # sizes follow the F account (compounding), as of the last daily record
     with ThreadPoolExecutor(max_workers=8) as pool:
-        data = list(pool.map(fetch, list(meta)))
+        data = list(pool.map(fetch, list(meta) if syms is None else syms))
     for sym, (t, a) in data:
         if not t or t[-1] != last_open:
             continue
@@ -556,7 +601,7 @@ def f_lines(meta, now_ms, last_open, eq):
             if x["e"] is None:
                 ref, D, tag = x["ref"], x["D"], f_label(nxt)
                 body = (f"📌 入场：下一根 1 小时开盘市价（{bj(nxt)}），参考价 {ref:.6g}\n"
-                        f"🛑 止损：成交价 + 2×ATR(1h)，约 {ref + D:.6g}（{D / ref * 100:.1f}%）\n"
+                        f"🛑 止损：成交价 + 2×ATR(1h)，约 {ref + D:.6g}（{D / ref * 100:.1f}%，下单同时挂好）\n"
                         f"⏱ {bj(nxt + 24 * HOUR)} 市价平仓（没碰止损的话）")
                 if tag is None:
                     body += (f"\n🎯 止盈参考（可选，按成交价重算）：第一阶段 2R 约 {ref - 2 * D:.6g} 平一半，之后止损移到入场价保本；"
@@ -636,6 +681,7 @@ def daily_summary(meta, d0):
 
     def fetch(sym):
         time.sleep(0.8)  # about 5 requests per second over 4 threads keeps the request weight low
+        daily_gate()
         try:
             return sym, closed_klines(sym, now, limit=need)
         except Exception:  # noqa: BLE001
@@ -673,6 +719,7 @@ def daily_summary(meta, d0):
 
     def fetch_h(sym):
         time.sleep(0.8)
+        daily_gate()
         try:
             return sym, hourly_klines(sym, now, limit=hlimit)
         except Exception:  # noqa: BLE001
@@ -823,8 +870,9 @@ def maybe_daily(meta, state):
     old = [x for x in open(p).read().splitlines() if x] if os.path.exists(p) else [head]
     width = len(head.split(","))
     rows = [head] + [x + "," * (width - len(x.split(","))) for x in old[1:]] + [row]
-    with open(p, "w") as f:
+    with open(p + ".tmp", "w") as f:  # replaced in one step: a cycle may read the file meanwhile
         f.write("\n".join(rows) + "\n")
+    os.replace(p + ".tmp", p)
     with open(os.path.join(REC, "daily.md"), "a") as f:
         f.write(text + "\n\n---\n\n")
     try:  # Monday: last 7 days; 1st and 16th: last 15 days; each followed by the totals since the alerts started
@@ -837,18 +885,55 @@ def maybe_daily(meta, state):
         print("daily record not pushed")
 
 
+def daily_worker(meta, state):
+    try:
+        maybe_daily(meta, state)
+    except Exception as e:  # noqa: BLE001 - the daily record must never stop the alerts
+        print("daily record failed:", e)
+        state["next_try"] = time.time() + 3600
+
+
+def gh(method, path, **kw):
+    """GitHub API call on this workflow (None outside Actions or when the request fails)."""
+    tok, repo = os.environ.get("GH_TOKEN"), os.environ.get("GITHUB_REPOSITORY")
+    if not (tok and repo):
+        return None
+    try:
+        return requests.request(method, f"https://api.github.com/repos/{repo}/actions/workflows/{WORKFLOW}/{path}",
+                                headers={"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json"},
+                                timeout=15, **kw)
+    except requests.RequestException as e:
+        print("github api failed:", e)
+        return None
+
+
+def newer_run_waiting():
+    """True when a later run of this workflow is waiting for this one (its concurrency group runs one at a time)."""
+    rid = int(os.environ.get("GITHUB_RUN_ID") or 0)
+    r = gh("GET", "runs", params={"per_page": 10})
+    try:
+        return bool(rid and r is not None and r.status_code == 200 and any(
+            x["id"] > rid and x["status"] != "completed" for x in r.json()["workflow_runs"]))
+    except (ValueError, KeyError) as e:
+        print("run list unreadable:", e)
+        return False
+
+
 def main():
     duration = int(os.environ.get("DURATION", "0"))
-    end = time.time() + duration
+    t0 = time.time()
     try:
         meta = universe()
     except Exception as e:  # noqa: BLE001
         send(f"⚠️ 提醒脚本连不上币安：{e}")
         raise
-    if os.environ.get("HEARTBEAT", "1") == "1":
-        send(f"✅ C+D+E 信号监控已启动（F 只记录），持续约 {duration // 3600} 小时，每 5 分钟检查一次（{len(meta)} 个币）")
-    last, errors, daily = None, 0, {}
+    # jobs hand over every few hours: say so once a day (the 08-09 start) and on manual starts
+    if os.environ.get("HEARTBEAT", "1") == "1" and (os.environ.get("GITHUB_EVENT_NAME") != "schedule"
+                                                   or datetime.now(BJT).hour in (8, 9)):
+        send(f"✅ 信号监控运行中：每根 5 分钟 K 线收盘后约 6 秒检查 C/D/E，整点先单独推 F（{len(meta)} 个币）")
+    last, errors, daily, worker, leaving = None, 0, {}, None, False
     while True:
+        PASS.set()
         try:
             last = one_pass(meta, last)
             errors = 0
@@ -856,15 +941,30 @@ def main():
             errors += 1
             if errors == 3:
                 send(f"⚠️ 提醒脚本连续出错：{e}")
-        try:
-            maybe_daily(meta, daily)
-        except Exception as e:  # noqa: BLE001 - the daily record must never stop the alerts
-            print("daily record failed:", e)
-            daily["next_try"] = time.time() + 3600
-        if time.time() >= end:
+        finally:
+            PASS.clear()
+        if duration <= 0:  # a single pass (local test): the daily record in line
+            daily_worker(meta, daily)
             break
-        nxt = (int(time.time()) // 300 + 1) * 300 + 20  # 20 s after the next 5m close
-        time.sleep(max(5, nxt - time.time()))
+        if not leaving and time.time() - t0 > 600:
+            if newer_run_waiting():
+                leaving = True
+            elif time.time() - t0 >= duration:  # time is up and no run is waiting (a skipped schedule): start one
+                r = gh("POST", "dispatches", json={"ref": os.environ.get("GITHUB_REF_NAME") or "main"})
+                print("next run requested:", None if r is None else r.status_code)
+                leaving = True
+        busy = worker is not None and worker.is_alive()
+        if not leaving and not busy:  # once leaving, a daily record still due is left to the next run
+            worker = threading.Thread(target=daily_worker, args=(meta, daily), daemon=True)
+            worker.start()
+        nxt = (int(time.time()) // 300 + 1) * 300  # the next 5m close
+        if leaving and not busy and nxt % 3600:
+            # end just before a 5m close that is not an hour close (F is due then): the waiting run needs well over
+            # 5 s to start, so its first cycle takes that close
+            time.sleep(max(0, nxt - 5 - time.time()))
+            print("handing over to the next run")
+            break
+        time.sleep(max(1, nxt + 6 - time.time()))  # 6 s after the close: Binance's bar is final by then
 
 
 if __name__ == "__main__":
