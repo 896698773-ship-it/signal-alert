@@ -143,6 +143,7 @@ def snap(mid):
 # de-vig on the remaining line) and bet365's line is 0 to 0.5 above Crown's -> full-time under at bet365.
 # Same definitions as search_kanpan/goal/frozen_xa_b365gen.py; first qualifying goal per match only.
 KMAX, FOU = 16, 21
+BAD = ("女", "U1", "U2", "青", "后备", "预备", "友谊", "U23", "U20", "U19", "U18", "U17")  # left out of the tested data too
 
 
 def _num(x):
@@ -432,7 +433,8 @@ if __name__ == "__main__":
                     w.writerow([snap_utc, *row, trig]); n += 1
                 if any(r[10] not in (None, "") and str(r[2]) not in ("早餐", "未开场") for r in rows):
                     active.add(mid)  # has an in-play full-time line -> worth a look every minute
-                x = xa_check(js) if mid not in alerted and js else None
+                names = "".join(fix.get(mid, (None, "", "", ""))[1:])
+                x = xa_check(js) if mid not in alerted and js and not any(b in names for b in BAD) else None
                 if x:
                     alerted.add(mid)
                     kt, lg, hn, an = fix.get(mid, (None, "", "", ""))
