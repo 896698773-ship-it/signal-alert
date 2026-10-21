@@ -390,6 +390,9 @@ if __name__ == "__main__":
     os.makedirs(OUT, exist_ok=True)
     t0 = time.time()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # a cancelled job still closes its gzip files
+    if os.environ.get("GITHUB_EVENT_NAME", "schedule") != "schedule":  # manual start: say it is running
+        tg("⚽ 足球记录器已启动：每分钟盯皇冠和 bet365 的滚球盘。模型 xa 有信号才推送（仅记录，不要下注），"
+           f"每天 {DAILY_HOUR} 点推昨日总结。")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
     path, fpath = os.path.join(OUT, f"{stamp}.csv.gz"), os.path.join(OUT, f"{stamp}_fixtures.csv.gz")
     apath = os.path.join(OUT, f"{stamp}_alerts.csv.gz")
