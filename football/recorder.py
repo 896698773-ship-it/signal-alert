@@ -6,11 +6,13 @@ falls back to 5-minute rounds for 30 minutes, to go easy on the site. Only robot
 Output: <out>/<UTC run start>.csv.gz, one row per match per book per snapshot.
 
 Record-only alert (no betting): the frozen rule xa_b365gen is checked on every snapshot and sent to Telegram once per
-match, also written to <out>/<UTC run start>_alerts.csv.gz with the prices at the moment of the alert.
+match, also written to <out>/<UTC run start>_alerts.csv.gz with the prices at the moment of the alert. From 10:00
+Beijing time the previous day's alerts (this job's and earlier jobs' on the football-data branch) are settled on the
+final scores and a daily summary is sent (xa_daily_<date>.csv.gz / xa_bets_<date>.csv.gz record it).
 
 Jobs hand over: once a later run of the workflow is waiting (or DURATION is up, when the job starts the next run
 itself) the job ends after a round, so recording continues with about a minute's gap."""
-import csv, gzip, math, os, re, signal, sys, time, json
+import csv, glob, gzip, io, math, os, re, signal, subprocess, sys, time, json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import requests
@@ -248,6 +250,117 @@ def tg(text):
     print("telegram send failed:", text[:100], flush=True)
 
 
+# ---------------------------------------------------------------- daily summary of the record-only alerts
+DAILY_HOUR = 10  # Beijing time; every match alerted the day before has finished by then
+
+
+def git(*a):
+    try:
+        return subprocess.run(["git", *a], capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def gz_rows(data):
+    """CSV rows (dicts) of a gzip file's bytes; a file without its end marker is read up to where it stops."""
+    out = []
+    try:
+        for r in csv.DictReader(io.TextIOWrapper(gzip.GzipFile(fileobj=io.BytesIO(data)), encoding="utf-8")):
+            out.append(r)
+    except (EOFError, OSError):
+        pass
+    return out
+
+
+def branch_files():
+    """{name: bytes getter} of data/ files on the football-data branch (fetched first)."""
+    git("fetch", "-q", "origin", "football-data")
+    r = git("ls-tree", "--name-only", "origin/football-data", "data/")
+    names = r.stdout.decode().split() if r and r.returncode == 0 else []
+    return {n.split("/")[-1]: (lambda n=n: (git("show", f"origin/football-data:{n}") or subprocess.CompletedProcess([], 1, b"")).stdout)
+            for n in names}
+
+
+def final_scores(days):
+    """{match_id: (home, away)} of finished matches on the finished-matches pages of these Beijing dates and the
+    live list (state -1 = finished)."""
+    out = {}
+    for d in days:
+        t = get(f"/football/Over_{d:%Y%m%d}.htm", "gbk")
+        for m in re.finditer(r"<tr[^>]*sId='(\d+)'[^>]*>(.*?)</tr>", t or "", re.S):
+            tds = re.findall(r"<td[^>]*>(.*?)</td>", m.group(2), re.S)
+            ft = re.findall(r">(\d+)<", tds[4]) if len(tds) >= 9 else []
+            if len(tds) >= 9 and strip(tds[2]) == "完" and len(ft) == 2:
+                out[m.group(1)] = (int(ft[0]), int(ft[1]))
+    for mid, (st, h, a) in live_scores().items():
+        if st == -1:
+            out.setdefault(mid, (h, a))
+    return out
+
+
+def xa_daily(out_dir):
+    """Settle yesterday's (Beijing date) xa alerts and send the summary once. True when done (or already done)."""
+    day = (datetime.now(BJT) - timedelta(days=1)).date()
+    tag = f"{day:%Y%m%d}"
+    if os.path.exists(os.path.join(out_dir, f"xa_daily_{tag}.csv.gz")):
+        return True
+    files = branch_files()
+    if f"xa_daily_{tag}.csv.gz" in files:
+        return True
+    alerts = {}
+    sources = [f() for n, f in sorted(files.items()) if n.endswith("_alerts.csv.gz")]
+    sources += [open(p, "rb").read() for p in sorted(glob.glob(os.path.join(out_dir, "*_alerts.csv.gz")))]
+    for data in sources:
+        for r in gz_rows(data):
+            if r.get("match_id") and r["match_id"] not in alerts:
+                alerts[r["match_id"]] = r
+    bjt = lambda r: datetime.strptime(r["snap_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).astimezone(BJT)
+    todays = sorted((r for r in alerts.values() if bjt(r).date() == day), key=bjt)
+    sc = final_scores([day - timedelta(days=1), day, day + timedelta(days=1)]) if todays else {}
+    bets, lines = [], []
+    for r in todays:
+        first = (_num(r["b365_first_line"]), _num(r["b365_first_under"]))
+        nowp = (_num(r["b365_now_line"]), _num(r["b365_now_under"]))
+        if not (nowp[0] == nowp[0] and nowp[1] == nowp[1]):  # no current price recorded -> the first quote
+            nowp = first
+        ft = sc.get(r["match_id"])
+        pn = _settle(nowp[0], sum(ft), nowp[1], True) if ft else None
+        pf = _settle(first[0], sum(ft), first[1], True) if ft else None
+        bets.append([tag, r["match_id"], r["league"], r["home"], r["away"], r["goal_min"], nowp[0], nowp[1], first[0], first[1],
+                     *(ft or ("", "")), "" if pn is None else round(pn, 4), "" if pf is None else round(pf, 4)])
+        res = "未找到完场比分" if ft is None else f"完场 {ft[0]}:{ft[1]} " + ("赢" if pn > 0.01 else "走水" if abs(pn) <= 0.01 else "输") + f" {pn:+.2f}"
+        lines.append(f"· {bjt(r):%H:%M} {r['league']} {r['home']} vs {r['away']} {r['home_goals']}:{r['away_goals']}，"
+                     f"{r['goal_min']} 分钟后 小 {nowp[0]:g}@{nowp[1]:.2f} → {res}")
+    done = [b for b in bets if b[-2] != ""]
+    sn, sf = sum(b[-2] for b in done), sum(b[-1] for b in done)
+    cum = [0, 0.0, 0.0]
+    for n, f in files.items():
+        if n.startswith("xa_daily_") and n < f"xa_daily_{tag}":
+            for r in gz_rows(f()):
+                cum[0] += int(r["settled"]); cum[1] += float(r["pnl_now"]); cum[2] += float(r["pnl_first"])
+    cum = [cum[0] + len(done), cum[1] + sn, cum[2] + sf]
+    with gzip.open(os.path.join(out_dir, f"xa_bets_{tag}.csv.gz"), "wt", newline="", encoding="utf-8") as fb:
+        wb = csv.writer(fb)
+        wb.writerow(["date", "match_id", "league", "home", "away", "goal_min", "line_now", "under_now", "line_first",
+                     "under_first", "ft_home", "ft_away", "pnl_now", "pnl_first"])
+        wb.writerows(bets)
+    with gzip.open(os.path.join(out_dir, f"xa_daily_{tag}.csv.gz"), "wt", newline="", encoding="utf-8") as fd:
+        wd = csv.writer(fd)
+        wd.writerow(["date", "alerts", "settled", "pnl_now", "pnl_first"])
+        wd.writerow([tag, len(bets), len(done), round(sn, 4), round(sf, 4)])
+    win = sum(1 for b in done if b[-2] > 0.01); push = sum(1 for b in done if abs(b[-2]) <= 0.01)
+    head = f"📊 小球模型 xa 昨日记录 {day:%m-%d}（仅记录，每注 1U，按推送时 bet365 的价）\n"
+    if not bets:
+        body = "昨天没有信号。"
+    else:
+        body = (f"{len(bets)} 注：赢 {win} 走水 {push} 输 {len(done) - win - push}" + (f"，{len(bets) - len(done)} 注没找到比分" if len(done) < len(bets) else "") +
+                f"，合计 {sn:+.2f}U（按进球后第一口价 {sf:+.2f}U）\n" + "\n".join(lines))
+    tail = (f"\n\n上线以来：{cum[0]} 注，合计 {cum[1]:+.2f}U，每注 {cum[1] / cum[0]:+.1%}（第一口价 {cum[2] / cum[0]:+.1%}）"
+            if cum[0] else "")
+    tg(head + body + tail)
+    return True
+
+
 def newer_run_waiting():
     """True when a later run of this workflow waits for this one (its concurrency group runs one at a time)."""
     tok, repo, rid = os.environ.get("GH_TOKEN"), os.environ.get("GITHUB_REPOSITORY"), int(os.environ.get("GITHUB_RUN_ID") or 0)
@@ -280,7 +393,7 @@ if __name__ == "__main__":
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
     path, fpath = os.path.join(OUT, f"{stamp}.csv.gz"), os.path.join(OUT, f"{stamp}_fixtures.csv.gz")
     apath = os.path.join(OUT, f"{stamp}_alerts.csv.gz")
-    fix, fix_t, written, seen_fix, alerted = {}, 0.0, 0, set(), set()
+    fix, fix_t, written, seen_fix, alerted, daily_next = {}, 0.0, 0, set(), set(), 0.0
     with gzip.open(path, "wt", newline="", encoding="utf-8") as f, gzip.open(fpath, "wt", newline="", encoding="utf-8") as ff, \
             gzip.open(apath, "wt", newline="", encoding="utf-8") as fa:
         w, wf, wa = csv.writer(f), csv.writer(ff), csv.writer(fa)
@@ -338,6 +451,14 @@ if __name__ == "__main__":
             if todo and (full_round or goal):
                 print(f"{now:%m-%d %H:%M} BJT  本轮 {len(todo)} 场（进球后补扫 {len(goal)}），记录 {n} 行（累计 {written}），"
                       f"用时 {time.time() - round_t:.0f} 秒", flush=True)
+            if datetime.now(BJT).hour >= DAILY_HOUR and time.time() >= daily_next:
+                try:
+                    if xa_daily(OUT):  # done for yesterday: look again after the next midnight
+                        nxt = (datetime.now(BJT) + timedelta(days=1)).replace(hour=DAILY_HOUR, minute=0, second=0)
+                        daily_next = nxt.timestamp()
+                except Exception as e:  # noqa: BLE001 - the summary must never stop the recording
+                    print("daily summary failed:", e, flush=True)
+                    daily_next = time.time() + 3600
             left = DURATION - (time.time() - t0)
             if left <= 0:
                 start_next_run()  # time is up and no run was waiting (a skipped schedule)
