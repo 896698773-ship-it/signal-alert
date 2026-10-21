@@ -33,7 +33,7 @@ FIX_COLS = ["match_id", "kickoff_bjt", "league", "home", "away"]
 ALERT_COLS = ["snap_utc", "match_id", "league", "home", "away", "home_goals", "away_goals", "goal_min",
               "crown_first_over", "crown_first_line", "crown_first_under", "b365_first_over", "b365_first_line",
               "b365_first_under", "lam_crown", "lam_b365", "crown_now_over", "crown_now_line", "crown_now_under",
-              "b365_now_over", "b365_now_line", "b365_now_under"]
+              "b365_now_over", "b365_now_line", "b365_now_under", "rule"]
 
 
 FAILS = [0, 0]  # failed requests, all requests in the current round
@@ -143,6 +143,10 @@ def snap(mid):
 # de-vig on the remaining line) and bet365's line is 0 to 0.5 above Crown's -> full-time under at bet365.
 # Same definitions as search_kanpan/goal/frozen_xa_b365gen.py; first qualifying goal per match only.
 KMAX, FOU = 16, 21
+# xa: frozen 2026-10-21 (validated). xa2: relaxed variant frozen 2026-10-21 before any new data was looked at
+# (2nd half from minute 46, gap >= 0.10, line gap up to 1 goal); recorded only, shown in the daily summary.
+RULES = {"xa": dict(min_minute=61, gap=0.15, lmax=0.5, push=True),
+         "xa2": dict(min_minute=46, gap=0.10, lmax=1.0, push=False)}
 BAD = ("女", "U1", "U2", "青", "后备", "预备", "友谊", "U23", "U20", "U19", "U18", "U17")  # left out of the tested data too
 
 
@@ -197,7 +201,7 @@ def _valid(o, L, u):
     return (o > 0 and u > 0 and abs(L * 4 - round(L * 4)) < 1e-6 and 1 / (1 + o) + 1 / (1 + u) >= 1)
 
 
-def xa_check(js):
+def xa_check(js, min_minute=61, gap=0.15, lmax=0.5):
     """The alert for the match's latest goal if it is the match's first qualifying goal, else None."""
     cr, bb = js.get("sOdds") or [], js.get("sOdds8") or []
     pad = lambda r: r + [None] * 46
@@ -215,15 +219,15 @@ def xa_check(js):
         gm = (min(int(p[0]), 45) if p[39] == 1 else max(int(p[0]), 46) if p[39] == 3 else int(p[0])) if isnum(p[0]) \
             else (46 if p[0] == "中场" else None)
         br = b365_first.get((_gn(r[1]), _gn(r[2])))
-        if r[39] != 3 or gm is None or gm < 61 or br is None:
+        if r[39] != 3 or gm is None or gm < min_minute or br is None:
             continue
         g = _gn(r[1]) + _gn(r[2])
         oc, Lc, uc = (_num(x) for x in r[FOU:FOU + 3])
         ob, Lb, ub = (_num(x) for x in br[FOU:FOU + 3])
-        if not (_valid(oc, Lc, uc) and _valid(ob, Lb, ub)) or not (-1e-9 <= Lb - Lc <= 0.5 + 1e-9):
+        if not (_valid(oc, Lc, uc) and _valid(ob, Lb, ub)) or not (-1e-9 <= Lb - Lc <= lmax + 1e-9):
             continue
         lc, lb = lam_rem(oc, Lc, uc, g), lam_rem(ob, Lb, ub, g)
-        if lc is None or lb is None or lb - lc < 0.15:
+        if lc is None or lb is None or lb - lc < gap:
             continue
         first = dict(row=j, h=_gn(r[1]), a=_gn(r[2]), gm=gm, c=(oc, Lc, uc), b=(ob, Lb, ub), lc=lc, lb=lb)
         break
@@ -300,7 +304,7 @@ def final_scores(days):
 
 
 def xa_daily(out_dir):
-    """Settle yesterday's (Beijing date) xa alerts and send the summary once. True when done (or already done)."""
+    """Settle yesterday's (Beijing date) alerts of every rule and send the summary once. True when done (or already)."""
     day = (datetime.now(BJT) - timedelta(days=1)).date()
     tag = f"{day:%Y%m%d}"
     if os.path.exists(os.path.join(out_dir, f"xa_daily_{tag}.csv.gz")):
@@ -313,52 +317,61 @@ def xa_daily(out_dir):
     sources += [open(p, "rb").read() for p in sorted(glob.glob(os.path.join(out_dir, "*_alerts.csv.gz")))]
     for data in sources:
         for r in gz_rows(data):
-            if r.get("match_id") and r["match_id"] not in alerts:
-                alerts[r["match_id"]] = r
+            if r.get("match_id"):
+                alerts.setdefault((r.get("rule") or "xa", r["match_id"]), r)
     bjt = lambda r: datetime.strptime(r["snap_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).astimezone(BJT)
-    todays = sorted((r for r in alerts.values() if bjt(r).date() == day), key=bjt)
+    todays = sorted(((k[0], r) for k, r in alerts.items() if bjt(r).date() == day), key=lambda x: bjt(x[1]))
     sc = final_scores([day - timedelta(days=1), day, day + timedelta(days=1)]) if todays else {}
-    bets, lines = [], []
-    for r in todays:
-        first = (_num(r["b365_first_line"]), _num(r["b365_first_under"]))
-        nowp = (_num(r["b365_now_line"]), _num(r["b365_now_under"]))
-        if not (nowp[0] == nowp[0] and nowp[1] == nowp[1]):  # no current price recorded -> the first quote
-            nowp = first
-        ft = sc.get(r["match_id"])
-        pn = _settle(nowp[0], sum(ft), nowp[1], True) if ft else None
-        pf = _settle(first[0], sum(ft), first[1], True) if ft else None
-        bets.append([tag, r["match_id"], r["league"], r["home"], r["away"], r["goal_min"], nowp[0], nowp[1], first[0], first[1],
-                     *(ft or ("", "")), "" if pn is None else round(pn, 4), "" if pf is None else round(pf, 4)])
-        res = "未找到完场比分" if ft is None else f"完场 {ft[0]}:{ft[1]} " + ("赢" if pn > 0.01 else "走水" if abs(pn) <= 0.01 else "输") + f" {pn:+.2f}"
-        lines.append(f"· {bjt(r):%H:%M} {r['league']} {r['home']} vs {r['away']} {r['home_goals']}:{r['away_goals']}，"
-                     f"{r['goal_min']} 分钟后 小 {nowp[0]:g}@{nowp[1]:.2f} → {res}")
-    done = [b for b in bets if b[-2] != ""]
-    sn, sf = sum(b[-2] for b in done), sum(b[-1] for b in done)
-    cum = [0, 0.0, 0.0]
+    cum = {}
     for n, f in files.items():
         if n.startswith("xa_daily_") and n < f"xa_daily_{tag}":
             for r in gz_rows(f()):
-                cum[0] += int(r["settled"]); cum[1] += float(r["pnl_now"]); cum[2] += float(r["pnl_first"])
-    cum = [cum[0] + len(done), cum[1] + sn, cum[2] + sf]
+                c = cum.setdefault(r.get("rule") or "xa", [0, 0.0, 0.0])
+                c[0] += int(r["settled"]); c[1] += float(r["pnl_now"]); c[2] += float(r["pnl_first"])
+    bets, daily, parts = [], [], []
+    for rule in RULES:
+        lines, mine = [], []
+        for rl, r in todays:
+            if rl != rule:
+                continue
+            first = (_num(r["b365_first_line"]), _num(r["b365_first_under"]))
+            nowp = (_num(r["b365_now_line"]), _num(r["b365_now_under"]))
+            if not (nowp[0] == nowp[0] and nowp[1] == nowp[1]):  # no current price recorded -> the first quote
+                nowp = first
+            ft = sc.get(r["match_id"])
+            pn = _settle(nowp[0], sum(ft), nowp[1], True) if ft else None
+            pf = _settle(first[0], sum(ft), first[1], True) if ft else None
+            mine.append([tag, rule, r["match_id"], r["league"], r["home"], r["away"], r["goal_min"], nowp[0], nowp[1], first[0],
+                         first[1], *(ft or ("", "")), "" if pn is None else round(pn, 4), "" if pf is None else round(pf, 4)])
+            res = "未找到完场比分" if ft is None else f"完场 {ft[0]}:{ft[1]} " + ("赢" if pn > 0.01 else "走水" if abs(pn) <= 0.01 else "输") + f" {pn:+.2f}"
+            lines.append(f"· {bjt(r):%H:%M} {r['league']} {r['home']} vs {r['away']} {r['home_goals']}:{r['away_goals']}，"
+                         f"{r['goal_min']} 分钟后 小 {nowp[0]:g}@{nowp[1]:.2f} → {res}")
+        done = [b for b in mine if b[-2] != ""]
+        sn, sf = sum(b[-2] for b in done), sum(b[-1] for b in done)
+        c = cum.setdefault(rule, [0, 0.0, 0.0]); c[0] += len(done); c[1] += sn; c[2] += sf
+        bets += mine
+        daily.append([tag, rule, len(mine), len(done), round(sn, 4), round(sf, 4)])
+        win = sum(1 for b in done if b[-2] > 0.01); push = sum(1 for b in done if abs(b[-2]) <= 0.01)
+        txt = f"【{rule}】" + ("昨天没有信号。" if not mine else
+                               f"{len(mine)} 注：赢 {win} 走水 {push} 输 {len(done) - win - push}" +
+                               (f"，{len(mine) - len(done)} 注没找到比分" if len(done) < len(mine) else "") +
+                               f"，合计 {sn:+.2f}U（按进球后第一口价 {sf:+.2f}U）")
+        if RULES[rule]["push"] and lines:
+            txt += "\n" + "\n".join(lines)
+        if c[0]:
+            txt += f"\n上线以来 {c[0]} 注，合计 {c[1]:+.2f}U，每注 {c[1] / c[0]:+.1%}（第一口价 {c[2] / c[0]:+.1%}）"
+        parts.append(txt)
     with gzip.open(os.path.join(out_dir, f"xa_bets_{tag}.csv.gz"), "wt", newline="", encoding="utf-8") as fb:
         wb = csv.writer(fb)
-        wb.writerow(["date", "match_id", "league", "home", "away", "goal_min", "line_now", "under_now", "line_first",
+        wb.writerow(["date", "rule", "match_id", "league", "home", "away", "goal_min", "line_now", "under_now", "line_first",
                      "under_first", "ft_home", "ft_away", "pnl_now", "pnl_first"])
         wb.writerows(bets)
     with gzip.open(os.path.join(out_dir, f"xa_daily_{tag}.csv.gz"), "wt", newline="", encoding="utf-8") as fd:
         wd = csv.writer(fd)
-        wd.writerow(["date", "alerts", "settled", "pnl_now", "pnl_first"])
-        wd.writerow([tag, len(bets), len(done), round(sn, 4), round(sf, 4)])
-    win = sum(1 for b in done if b[-2] > 0.01); push = sum(1 for b in done if abs(b[-2]) <= 0.01)
-    head = f"📊 小球模型 xa 昨日记录 {day:%m-%d}（仅记录，每注 1U，按推送时 bet365 的价）\n"
-    if not bets:
-        body = "昨天没有信号。"
-    else:
-        body = (f"{len(bets)} 注：赢 {win} 走水 {push} 输 {len(done) - win - push}" + (f"，{len(bets) - len(done)} 注没找到比分" if len(done) < len(bets) else "") +
-                f"，合计 {sn:+.2f}U（按进球后第一口价 {sf:+.2f}U）\n" + "\n".join(lines))
-    tail = (f"\n\n上线以来：{cum[0]} 注，合计 {cum[1]:+.2f}U，每注 {cum[1] / cum[0]:+.1%}（第一口价 {cum[2] / cum[0]:+.1%}）"
-            if cum[0] else "")
-    tg(head + body + tail)
+        wd.writerow(["date", "rule", "alerts", "settled", "pnl_now", "pnl_first"])
+        wd.writerows(daily)
+    tg(f"📊 小球模型昨日记录 {day:%m-%d}（仅记录，每注 1U，按推送时 bet365 的价；xa2 = 放宽版，只记录不推送）\n\n"
+       + "\n\n".join(parts))
     return True
 
 
@@ -434,17 +447,22 @@ if __name__ == "__main__":
                 if any(r[10] not in (None, "") and str(r[2]) not in ("早餐", "未开场") for r in rows):
                     active.add(mid)  # has an in-play full-time line -> worth a look every minute
                 names = "".join(fix.get(mid, (None, "", "", ""))[1:])
-                x = xa_check(js) if mid not in alerted and js and not any(b in names for b in BAD) else None
-                if x:
-                    alerted.add(mid)
+                for rule, cfg in RULES.items():
+                    if (rule, mid) in alerted or not js or any(b in names for b in BAD):
+                        continue
+                    x = xa_check(js, cfg["min_minute"], cfg["gap"], cfg["lmax"])
+                    if not x:
+                        continue
+                    alerted.add((rule, mid))
                     kt, lg, hn, an = fix.get(mid, (None, "", "", ""))
                     wa.writerow([snap_utc, mid, lg, hn, an, x["h"], x["a"], x["gm"], *x["c"], *x["b"], round(x["lc"], 3),
-                                 round(x["lb"], 3), *x["c_now"], *x["b_now"]]); fa.flush()
+                                 round(x["lb"], 3), *x["c_now"], *x["b_now"], rule]); fa.flush()
                     bn = x["b_now"]
-                    tg(f"🧪 小球模型 xa（仅记录，不要下注）\n{lg} {hn} vs {an}  {x['h']}:{x['a']}，{x['gm']} 分钟进球后\n"
-                       f"bet365 第一口：全场 {x['b'][1]:g} 小 {x['b'][2]:.2f}｜皇冠第一口：{x['c'][1]:g} 小 {x['c'][2]:.2f}\n"
-                       f"→ bet365 全场小" + (f"，现在 {bn[1]:g} 小 {bn[2]:.2f}" if bn[1] is not None else "") +
-                       f"\n（北京时间 {datetime.now(BJT):%H:%M}）")
+                    if cfg["push"]:
+                        tg(f"🧪 小球模型 {rule}（仅记录，不要下注）\n{lg} {hn} vs {an}  {x['h']}:{x['a']}，{x['gm']} 分钟进球后\n"
+                           f"bet365 第一口：全场 {x['b'][1]:g} 小 {x['b'][2]:.2f}｜皇冠第一口：{x['c'][1]:g} 小 {x['c'][2]:.2f}\n"
+                           f"→ bet365 全场小" + (f"，现在 {bn[1]:g} 小 {bn[2]:.2f}" if bn[1] is not None else "") +
+                           f"\n（北京时间 {datetime.now(BJT):%H:%M}）")
                 if rows and mid not in seen_fix and mid in fix:
                     kt, lg, h, a = fix[mid]
                     wf.writerow([mid, kt.strftime("%Y-%m-%d %H:%M"), lg, h, a]); seen_fix.add(mid)
