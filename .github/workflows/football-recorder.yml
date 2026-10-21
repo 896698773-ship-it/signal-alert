@@ -1,15 +1,18 @@
 name: football-recorder
-# Data only: snapshots of live Crown / bet365 football prices every 5 minutes, saved to the football-data branch.
+# Snapshots of live Crown / bet365 football prices (every minute for matches with in-play quotes), saved to the
+# football-data branch, plus record-only Telegram alerts of the frozen rule xa_b365gen. A job hands over to the next
+# one once a later run is waiting (or DURATION is up, when it starts the next run itself), so there is no long gap.
 on:
   schedule:
-    - cron: "17 */6 * * *"
+    - cron: "17 */4 * * *"
   workflow_dispatch:
     inputs:
       duration:
-        description: "seconds to record (short values are for testing)"
-        default: "20400"
+        description: "most seconds to record (short values are for testing)"
+        default: "19800"
 permissions:
   contents: write
+  actions: write   # see whether the next run is waiting, or start it
 concurrency:
   group: football-recorder
   cancel-in-progress: false
@@ -25,7 +28,10 @@ jobs:
       - run: pip install requests
       - run: python -u football/recorder.py out
         env:
-          DURATION: ${{ inputs.duration || '20400' }}
+          DURATION: ${{ inputs.duration || '19800' }}
+          GH_TOKEN: ${{ github.token }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: "8623876357"
       - name: Save to the football-data branch
         if: always()
         run: |

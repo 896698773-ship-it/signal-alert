@@ -3,8 +3,14 @@
 every 5 minutes it also snapshots all other matches in play. The one-file live score list is read each minute and a
 match whose score changed is snapshotted at once (trigger 'goal'). If more than 20% of requests fail in a round it
 falls back to 5-minute rounds for 30 minutes, to go easy on the site. Only robots.txt-allowed paths, no query strings.
-Output: <out>/<UTC run start>.csv.gz, one row per match per book per snapshot."""
-import csv, gzip, os, re, sys, time, json
+Output: <out>/<UTC run start>.csv.gz, one row per match per book per snapshot.
+
+Record-only alert (no betting): the frozen rule xa_b365gen is checked on every snapshot and sent to Telegram once per
+match, also written to <out>/<UTC run start>_alerts.csv.gz with the prices at the moment of the alert.
+
+Jobs hand over: once a later run of the workflow is waiting (or DURATION is up, when the job starts the next run
+itself) the job ends after a round, so recording continues with about a minute's gap."""
+import csv, gzip, math, os, re, signal, sys, time, json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import requests
@@ -12,7 +18,8 @@ import requests
 BJT = timezone(timedelta(hours=8))
 BASE = "https://bf.titan007.com"
 OUT = sys.argv[1] if len(sys.argv) > 1 else "out"
-DURATION = int(os.environ.get("DURATION", "20400"))
+DURATION = int(os.environ.get("DURATION", "19800"))
+WORKFLOW = "football-recorder.yml"
 STEP = 300
 GOAL_STEP = 60  # the live score list is read once a minute to catch goals
 S = requests.Session()
@@ -21,6 +28,10 @@ COLS = ["snap_utc", "match_id", "book", "label", "home_goals", "away_goals", "st
         "half_ou_over", "half_ou_line", "half_ou_under", "full_ou_over", "full_ou_line", "full_ou_under",
         "half_ah_home", "half_ah_line", "half_ah_away", "full_ah_home", "full_ah_line", "full_ah_away", "trigger"]
 FIX_COLS = ["match_id", "kickoff_bjt", "league", "home", "away"]
+ALERT_COLS = ["snap_utc", "match_id", "league", "home", "away", "home_goals", "away_goals", "goal_min",
+              "crown_first_over", "crown_first_line", "crown_first_under", "b365_first_over", "b365_first_line",
+              "b365_first_under", "lam_crown", "lam_b365", "crown_now_over", "crown_now_line", "crown_now_under",
+              "b365_now_over", "b365_now_line", "b365_now_under"]
 
 
 FAILS = [0, 0]  # failed requests, all requests in the current round
@@ -107,29 +118,173 @@ def parse_js(t):
 
 
 def snap(mid):
+    """Snapshot rows (the last row of each book that carries a price; bet365 often ends with an empty placeholder
+    row around half-time) and the parsed arrays."""
     t = get(f"/jsData/{mid[:2]}/{mid[2:4]}/{mid}.js")
     time.sleep(0.1)
     if not t:
-        return []
-    rows = []
+        return [], {}
+    js, rows = parse_js(t), []
     for key, book in (("sOdds", "crown"), ("sOdds8", "b365")):
-        arr = parse_js(t).get(key) or []
+        arr = js.get(key) or []
         if not arr:
             continue
-        r = arr[-1] + [None] * 46
+        priced = [x for x in arr if any(v not in (None, "") for v in (x + [None] * 46)[3:27])]
+        r = (priced or arr)[-1] + [None] * 46
         rows.append([mid, book, r[0], r[1], r[2], r[39], *r[18:21], *r[24:27], *r[6:9], *r[12:15]])
-    return rows
+    return rows, js
+
+
+# ---------------------------------------------------------------- frozen rule xa_b365gen (record only)
+# After a second-half goal at minute >= 61 (minute = Crown's last quote before the goal), compare the two books' FIRST
+# full-time O/U quote at the new score. If bet365's implies >= 0.15 more remaining goals than Crown's (equal-EV Poisson
+# de-vig on the remaining line) and bet365's line is 0 to 0.5 above Crown's -> full-time under at bet365.
+# Same definitions as search_kanpan/goal/frozen_xa_b365gen.py; first qualifying goal per match only.
+KMAX, FOU = 16, 21
+
+
+def _num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _gn(x):
+    try:
+        return int(x) if x is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _settle(L, k, price, under):
+    """Asian under (or over) pnl per unit at HK odds; quarter lines split in half."""
+    q = round(L * 4)
+    parts = (L - 0.25, L + 0.25) if q % 2 else (L, L)
+    out = 0.0
+    for x in parts:
+        win = k < x - 1e-9 if under else k > x + 1e-9
+        out += 0.5 * (price if win else (0.0 if abs(k - x) < 1e-9 else -1.0))
+    return out
+
+
+def _pmf(lam):
+    p = [math.exp(k * math.log(max(lam, 1e-12)) - lam - math.lgamma(k + 1)) for k in range(KMAX)]
+    p[-1] += max(0.0, 1 - sum(p))
+    return p
+
+
+def lam_rem(o, L, u, g):
+    """Remaining-goals Poisson mean at which under and over have the same expected pnl (None if invalid)."""
+    L = L - g
+    if not (o > 0 and u > 0 and o < 30 and u < 30 and L > 0 and abs(L * 4 - round(L * 4)) < 1e-6):
+        return None
+    d = [_settle(L, k, u, True) - _settle(L, k, o, False) for k in range(KMAX)]
+    a, b = 1e-3, 9.0
+    for _ in range(40):
+        mid = 0.5 * (a + b)
+        if sum(p * x for p, x in zip(_pmf(mid), d)) > 0:
+            a = mid
+        else:
+            b = mid
+    return 0.5 * (a + b)
+
+
+def _valid(o, L, u):
+    return (o > 0 and u > 0 and abs(L * 4 - round(L * 4)) < 1e-6 and 1 / (1 + o) + 1 / (1 + u) >= 1)
+
+
+def xa_check(js):
+    """The alert for the match's latest goal if it is the match's first qualifying goal, else None."""
+    cr, bb = js.get("sOdds") or [], js.get("sOdds8") or []
+    pad = lambda r: r + [None] * 46
+    cr, bb = [pad(r) for r in cr], [pad(r) for r in bb]
+    isnum = lambda x: isinstance(x, str) and x.isdigit()
+    b365_first = {}
+    for r in bb:
+        if isnum(r[0]) and r[39] in (1, 3):
+            b365_first.setdefault((_gn(r[1]), _gn(r[2])), r)
+    first = None
+    for j in range(1, len(cr)):
+        r, p = cr[j], cr[j - 1]
+        if not isnum(r[0]) or r[39] not in (1, 3) or _gn(r[1]) + _gn(r[2]) <= _gn(p[1]) + _gn(p[2]):
+            continue
+        gm = (min(int(p[0]), 45) if p[39] == 1 else max(int(p[0]), 46) if p[39] == 3 else int(p[0])) if isnum(p[0]) \
+            else (46 if p[0] == "中场" else None)
+        br = b365_first.get((_gn(r[1]), _gn(r[2])))
+        if r[39] != 3 or gm is None or gm < 61 or br is None:
+            continue
+        g = _gn(r[1]) + _gn(r[2])
+        oc, Lc, uc = (_num(x) for x in r[FOU:FOU + 3])
+        ob, Lb, ub = (_num(x) for x in br[FOU:FOU + 3])
+        if not (_valid(oc, Lc, uc) and _valid(ob, Lb, ub)) or not (-1e-9 <= Lb - Lc <= 0.5 + 1e-9):
+            continue
+        lc, lb = lam_rem(oc, Lc, uc, g), lam_rem(ob, Lb, ub, g)
+        if lc is None or lb is None or lb - lc < 0.15:
+            continue
+        first = dict(row=j, h=_gn(r[1]), a=_gn(r[2]), gm=gm, c=(oc, Lc, uc), b=(ob, Lb, ub), lc=lc, lb=lb)
+        break
+    if not first or (first["h"], first["a"]) != (_gn(cr[-1][1]), _gn(cr[-1][2])):
+        return None  # no qualifying goal, or it was an earlier goal (already alerted then)
+    now = lambda arr: next(((_num(x[24]), _num(x[25]), _num(x[26])) for x in reversed(arr)
+                            if (_gn(x[1]), _gn(x[2])) == (first["h"], first["a"]) and x[25] not in (None, "")), (None,) * 3)
+    first.update(c_now=now(cr), b_now=now(bb))
+    return first
+
+
+def tg(text):
+    tok, chat = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+    if not tok or not chat:
+        print(text, flush=True)
+        return
+    for _ in range(3):
+        try:
+            if requests.post(f"https://api.telegram.org/bot{tok}/sendMessage", timeout=(5, 15),
+                             json={"chat_id": chat, "text": text, "disable_web_page_preview": True}).status_code == 200:
+                return
+        except requests.RequestException:
+            pass
+        time.sleep(2)
+    print("telegram send failed:", text[:100], flush=True)
+
+
+def newer_run_waiting():
+    """True when a later run of this workflow waits for this one (its concurrency group runs one at a time)."""
+    tok, repo, rid = os.environ.get("GH_TOKEN"), os.environ.get("GITHUB_REPOSITORY"), int(os.environ.get("GITHUB_RUN_ID") or 0)
+    if not (tok and repo and rid):
+        return False
+    try:
+        r = requests.get(f"https://api.github.com/repos/{repo}/actions/workflows/{WORKFLOW}/runs", params={"per_page": 10},
+                         headers={"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json"}, timeout=15)
+        return r.status_code == 200 and any(x["id"] > rid and x["status"] != "completed" for x in r.json()["workflow_runs"])
+    except (requests.RequestException, ValueError, KeyError):
+        return False
+
+
+def start_next_run():
+    tok, repo = os.environ.get("GH_TOKEN"), os.environ.get("GITHUB_REPOSITORY")
+    if tok and repo:
+        try:
+            r = requests.post(f"https://api.github.com/repos/{repo}/actions/workflows/{WORKFLOW}/dispatches",
+                              json={"ref": os.environ.get("GITHUB_REF_NAME") or "main"}, timeout=15,
+                              headers={"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json"})
+            print("next run requested:", r.status_code, flush=True)
+        except requests.RequestException as e:
+            print("next run not requested:", e, flush=True)
 
 
 if __name__ == "__main__":
     os.makedirs(OUT, exist_ok=True)
     t0 = time.time()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # a cancelled job still closes its gzip files
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
     path, fpath = os.path.join(OUT, f"{stamp}.csv.gz"), os.path.join(OUT, f"{stamp}_fixtures.csv.gz")
-    fix, fix_t, written, seen_fix = {}, 0.0, 0, set()
-    with gzip.open(path, "wt", newline="", encoding="utf-8") as f, gzip.open(fpath, "wt", newline="", encoding="utf-8") as ff:
-        w, wf = csv.writer(f), csv.writer(ff)
-        w.writerow(COLS); wf.writerow(FIX_COLS)
+    apath = os.path.join(OUT, f"{stamp}_alerts.csv.gz")
+    fix, fix_t, written, seen_fix, alerted = {}, 0.0, 0, set(), set()
+    with gzip.open(path, "wt", newline="", encoding="utf-8") as f, gzip.open(fpath, "wt", newline="", encoding="utf-8") as ff, \
+            gzip.open(apath, "wt", newline="", encoding="utf-8") as fa:
+        w, wf, wa = csv.writer(f), csv.writer(ff), csv.writer(fa)
+        w.writerow(COLS); wf.writerow(FIX_COLS); wa.writerow(ALERT_COLS)
         last_full, prev, active, slow_until = 0.0, {}, set(), 0.0
         while time.time() - t0 < DURATION:
             round_t = time.time()
@@ -156,11 +311,22 @@ if __name__ == "__main__":
             with ThreadPoolExecutor(5) as ex:
                 res = list(ex.map(lambda x: snap(x[0]), todo))
             n = 0
-            for (mid, trig), rows in zip(todo, res):
+            for (mid, trig), (rows, js) in zip(todo, res):
                 for row in rows:
                     w.writerow([snap_utc, *row, trig]); n += 1
-                if any(r[8] not in (None, "") and str(r[2]) not in ("早餐", "未开场") for r in rows):
+                if any(r[10] not in (None, "") and str(r[2]) not in ("早餐", "未开场") for r in rows):
                     active.add(mid)  # has an in-play full-time line -> worth a look every minute
+                x = xa_check(js) if mid not in alerted and js else None
+                if x:
+                    alerted.add(mid)
+                    kt, lg, hn, an = fix.get(mid, (None, "", "", ""))
+                    wa.writerow([snap_utc, mid, lg, hn, an, x["h"], x["a"], x["gm"], *x["c"], *x["b"], round(x["lc"], 3),
+                                 round(x["lb"], 3), *x["c_now"], *x["b_now"]]); fa.flush()
+                    bn = x["b_now"]
+                    tg(f"🧪 小球模型 xa（仅记录，不要下注）\n{lg} {hn} vs {an}  {x['h']}:{x['a']}，{x['gm']} 分钟进球后\n"
+                       f"bet365 第一口：全场 {x['b'][1]:g} 小 {x['b'][2]:.2f}｜皇冠第一口：{x['c'][1]:g} 小 {x['c'][2]:.2f}\n"
+                       f"→ bet365 全场小" + (f"，现在 {bn[1]:g} 小 {bn[2]:.2f}" if bn[1] is not None else "") +
+                       f"\n（北京时间 {datetime.now(BJT):%H:%M}）")
                 if rows and mid not in seen_fix and mid in fix:
                     kt, lg, h, a = fix[mid]
                     wf.writerow([mid, kt.strftime("%Y-%m-%d %H:%M"), lg, h, a]); seen_fix.add(mid)
@@ -174,6 +340,10 @@ if __name__ == "__main__":
                       f"用时 {time.time() - round_t:.0f} 秒", flush=True)
             left = DURATION - (time.time() - t0)
             if left <= 0:
+                start_next_run()  # time is up and no run was waiting (a skipped schedule)
+                break
+            if full_round and time.time() - t0 > 600 and newer_run_waiting():
+                print("handing over to the next run", flush=True)
                 break
             time.sleep(max(1, min(left, GOAL_STEP - (time.time() - round_t))))
     print("done", written, flush=True)
