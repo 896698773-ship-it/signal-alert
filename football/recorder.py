@@ -1,7 +1,8 @@
-"""Football in-play recorder (data only, no betting signals). Every 5 minutes it takes a snapshot of the live Crown and
-bet365 prices of every match in play on titan007 (first-half / full-time over-under and Asian handicap). In between,
-once a minute, it reads the one-file live score list; when a score changes it snapshots that match at once, so the
-first quote after a goal is caught too (trigger = 'goal'). Only robots.txt-allowed paths, no query strings.
+"""Football in-play recorder (data only, no betting signals). Every minute it snapshots the live Crown and bet365 prices
+(first-half / full-time over-under and Asian handicap) of every in-play match that had an in-play quote last time;
+every 5 minutes it also snapshots all other matches in play. The one-file live score list is read each minute and a
+match whose score changed is snapshotted at once (trigger 'goal'). If more than 20% of requests fail in a round it
+falls back to 5-minute rounds for 30 minutes, to go easy on the site. Only robots.txt-allowed paths, no query strings.
 Output: <out>/<UTC run start>.csv.gz, one row per match per book per snapshot."""
 import csv, gzip, os, re, sys, time, json
 from concurrent.futures import ThreadPoolExecutor
@@ -22,7 +23,11 @@ COLS = ["snap_utc", "match_id", "book", "label", "home_goals", "away_goals", "st
 FIX_COLS = ["match_id", "kickoff_bjt", "league", "home", "away"]
 
 
+FAILS = [0, 0]  # failed requests, all requests in the current round
+
+
 def get(path, enc=None):
+    FAILS[1] += 1
     for k in range(3):
         try:
             r = S.get(BASE + path, timeout=25)
@@ -33,6 +38,7 @@ def get(path, enc=None):
         except requests.RequestException:
             pass
         time.sleep(3 * (k + 1))
+    FAILS[0] += 1
     return None
 
 
@@ -102,7 +108,7 @@ def parse_js(t):
 
 def snap(mid):
     t = get(f"/jsData/{mid[:2]}/{mid[2:4]}/{mid}.js")
-    time.sleep(0.3)
+    time.sleep(0.1)
     if not t:
         return []
     rows = []
@@ -124,37 +130,50 @@ if __name__ == "__main__":
     with gzip.open(path, "wt", newline="", encoding="utf-8") as f, gzip.open(fpath, "wt", newline="", encoding="utf-8") as ff:
         w, wf = csv.writer(f), csv.writer(ff)
         w.writerow(COLS); wf.writerow(FIX_COLS)
-        last_full, prev = 0.0, {}
+        last_full, prev, active, slow_until = 0.0, {}, set(), 0.0
         while time.time() - t0 < DURATION:
+            round_t = time.time()
             now = datetime.now(BJT)
             if time.time() - fix_t > 3600 or not fix:
                 fix, fix_t = fixtures(now) or fix, time.time()
+            FAILS[0] = FAILS[1] = 0
             ls = live_scores()
-            goal = [mid for mid, (st, h, a) in ls.items() if st in (1, 2, 3) and mid in prev and (h, a) != prev[mid]]
-            prev = {mid: (h, a) for mid, (st, h, a) in ls.items()}
-            todo = []
-            if time.time() - last_full >= STEP - 5:
+            in_play = {mid for mid, (st, *_r) in ls.items() if st in (1, 2, 3)}
+            goal = [mid for mid in in_play if mid in prev and ls[mid][1:] != prev[mid]]
+            prev = {mid: v[1:] for mid, v in ls.items()}
+            full_round = time.time() - last_full >= STEP - 5
+            if full_round:
                 last_full = time.time()
-                live = [mid for mid, (kt, *_r) in fix.items() if kt - timedelta(minutes=2) <= now <= kt + timedelta(minutes=130)]
-                live += [mid for mid, (st, *_r) in ls.items() if st in (1, 2, 3) and mid not in live]
-                todo = [(mid, "5min") for mid in live]
-            todo += [(mid, "goal") for mid in goal if mid not in {m for m, _ in todo}]
+                live = {mid for mid, (kt, *_r) in fix.items() if kt - timedelta(minutes=2) <= now <= kt + timedelta(minutes=130)} | in_play
+                todo = [(mid, "goal" if mid in goal else "5min") for mid in sorted(live)]
+            elif time.time() >= slow_until:
+                todo = [(mid, "goal" if mid in goal else "1min") for mid in sorted(active & in_play)]
+            else:
+                todo = []
+            done_ids = {m for m, _ in todo}
+            todo += [(mid, "goal") for mid in goal if mid not in done_ids]
             snap_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            with ThreadPoolExecutor(3) as ex:
+            with ThreadPoolExecutor(5) as ex:
                 res = list(ex.map(lambda x: snap(x[0]), todo))
             n = 0
             for (mid, trig), rows in zip(todo, res):
                 for row in rows:
                     w.writerow([snap_utc, *row, trig]); n += 1
+                if any(r[8] not in (None, "") and str(r[2]) not in ("早餐", "未开场") for r in rows):
+                    active.add(mid)  # has an in-play full-time line -> worth a look every minute
                 if rows and mid not in seen_fix and mid in fix:
                     kt, lg, h, a = fix[mid]
                     wf.writerow([mid, kt.strftime("%Y-%m-%d %H:%M"), lg, h, a]); seen_fix.add(mid)
             f.flush(); ff.flush()
             written += n
-            if todo:
-                print(f"{now:%m-%d %H:%M} BJT  快照 {len(todo)} 场（其中进球后补扫 {len(goal)}），记录 {n} 行（累计 {written}）", flush=True)
+            if FAILS[1] and FAILS[0] / FAILS[1] > 0.2:
+                slow_until = time.time() + 1800
+                print(f"{now:%m-%d %H:%M} BJT  失败 {FAILS[0]}/{FAILS[1]}，改成 5 分钟一轮，30 分钟后再恢复", flush=True)
+            if todo and (full_round or goal):
+                print(f"{now:%m-%d %H:%M} BJT  本轮 {len(todo)} 场（进球后补扫 {len(goal)}），记录 {n} 行（累计 {written}），"
+                      f"用时 {time.time() - round_t:.0f} 秒", flush=True)
             left = DURATION - (time.time() - t0)
             if left <= 0:
                 break
-            time.sleep(max(1, min(left, GOAL_STEP - (time.time() - t0) % GOAL_STEP)))
+            time.sleep(max(1, min(left, GOAL_STEP - (time.time() - round_t))))
     print("done", written, flush=True)
