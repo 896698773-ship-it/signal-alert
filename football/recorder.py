@@ -253,6 +253,7 @@ def tg(text):
         try:
             if requests.post(f"https://api.telegram.org/bot{tok}/sendMessage", timeout=(5, 15),
                              json={"chat_id": chat, "text": text, "disable_web_page_preview": True}).status_code == 200:
+                print(f"{datetime.now(VNT):%H:%M:%S} VN telegram sent:", text[:50].replace("\n", " "), flush=True)
                 return
         except requests.RequestException:
             pass
