@@ -1,4 +1,5 @@
-"""5-minute signal alert for the C + D + E models (no AI needed), pushed to Telegram.
+"""5-minute signal alert for the C + D + E models and hourly F (no AI needed). Only F is pushed to Telegram; C / D / E
+are record only since 2026-10-22 (logged and counted in the daily record).
 
 Rules (unchanged from the backtests; nothing added):
   E long : BTC 5m close < 48 bars ago; coin 24h quote vol >= 10M; 24h change <= 0;
@@ -392,10 +393,10 @@ def one_pass(meta, last_done):
     rl, rs = float(os.environ.get("RISK_LONG", "0.02")), float(os.environ.get("RISK_SHORT", "0.01"))
     rc, rd = float(os.environ.get("RISK_C", "0.02")), float(os.environ.get("RISK_D", "0.02"))
     capd = float(os.environ.get("CAP_D", "0.01"))
-    lines = []
+    lines, f_rest = [], []
     if (bar + 300_000) % HOUR == 0:  # the last 5m bar of an hour: that 1h bar has closed too, F goes out first
         try:
-            lines += f_first(meta, now_ms, bar, eq)
+            f_rest = f_first(meta, now_ms, bar, eq)
         except Exception as e:  # noqa: BLE001 - F must not hold up C/D/E
             send(f"⚠️ F 检查出错：{e}")
 
@@ -444,9 +445,12 @@ def one_pass(meta, last_done):
         if c_pending:
             lines.append(fmt_entry("C", c_pending, bar, eq, rc, meta, 3, 24, "跌破前 6 小时最低价"))
     if lines:
-        send(f"⏰ {bj(bar)} 收盘信号（BTC 4h {'跌' if btc_down else '涨'}）\n\n" + "\n\n".join(lines))
+        # C / D / E are record only (the user's choice, 2026-10-22): logged here and counted in the daily record, not pushed
+        print(f"⏰ {bj(bar)} 收盘信号（只记录，不推送）（BTC 4h {'跌' if btc_down else '涨'}）\n\n" + "\n\n".join(lines), flush=True)
     else:
         print(bj(bar), "no signal")
+    if f_rest:  # F exits of the coins checked after the first F message
+        send(f"⏰ {bj(bar + 300_000)} 整点 F（其余币的平仓）\n\n" + "\n\n".join(f_rest))
     return bar
 
 
@@ -930,7 +934,7 @@ def main():
     # jobs hand over every few hours: say so once a day (the 08-09 start) and on manual starts
     if os.environ.get("HEARTBEAT", "1") == "1" and (os.environ.get("GITHUB_EVENT_NAME") != "schedule"
                                                    or datetime.now(BJT).hour in (8, 9)):
-        send(f"✅ 信号监控运行中：每根 5 分钟 K 线收盘后约 6 秒检查 C/D/E，整点先单独推 F（{len(meta)} 个币）")
+        send(f"✅ 信号监控运行中：整点推送 F；C/D/E 只记录不推送，战绩照常在每日记录里（{len(meta)} 个币）")
     last, errors, daily, worker, leaving = None, 0, {}, None, False
     while True:
         PASS.set()
