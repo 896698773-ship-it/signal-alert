@@ -24,7 +24,7 @@ OUT = sys.argv[1] if len(sys.argv) > 1 else "out"
 DURATION = int(os.environ.get("DURATION", "19800"))
 WORKFLOW = "football-recorder.yml"
 STEP = 300
-GOAL_STEP = 60  # the live score list is read once a minute to catch goals
+GOAL_STEP = 30  # the live score list is read every 30 s; second-half matches are snapshotted every 30 s, others every 60 s
 S = requests.Session()
 S.headers["User-Agent"] = "Mozilla/5.0"
 COLS = ["snap_utc", "match_id", "book", "label", "home_goals", "away_goals", "state",
@@ -421,7 +421,7 @@ if __name__ == "__main__":
             gzip.open(apath, "wt", newline="", encoding="utf-8") as fa:
         w, wf, wa = csv.writer(f), csv.writer(ff), csv.writer(fa)
         w.writerow(COLS); wf.writerow(FIX_COLS); wa.writerow(ALERT_COLS)
-        last_full, prev, active, slow_until, playing, sig = 0.0, {}, set(), 0.0, set(), {}
+        last_full, prev, active, slow_until, playing, sig, half2, rnd = 0.0, {}, set(), 0.0, set(), {}, set(), 0
         while time.time() - t0 < DURATION:
             round_t = time.time()
             now = datetime.now(BJT)
@@ -439,7 +439,9 @@ if __name__ == "__main__":
                 todo = [(mid, "goal" if mid in goal else "5min") for mid in sorted(live)]
             elif time.time() >= slow_until:
                 # in play per the live list, or per the match's own last snapshot (some leagues are not in the list)
-                todo = [(mid, "goal" if mid in goal else "1min") for mid in sorted(active & (in_play | playing))]
+                rnd += 1  # second-half matches (where xa / xa2 can fire) every round, the rest every other round
+                todo = [(mid, "goal" if mid in goal else "1min") for mid in sorted(active & (in_play | playing))
+                        if mid in half2 or rnd % 2 == 0]
             else:
                 todo = []
             done_ids = {m for m, _ in todo}
@@ -459,6 +461,7 @@ if __name__ == "__main__":
                         sig[mid] = (key, time.time())
                     live_now = any(r[5] in (1, 2, 3) for r in rows) and time.time() - sig[mid][1] < 600
                     (playing.add if live_now else playing.discard)(mid)
+                    (half2.add if live_now and any(r[5] == 3 for r in rows) else half2.discard)(mid)
                 names = "".join(fix.get(mid, (None, "", "", ""))[1:])
                 fired = []
                 youth = any(b in names for b in YOUTH)

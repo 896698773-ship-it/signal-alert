@@ -330,6 +330,11 @@ def fmt_exit(model, pos, ex, bar):
 R_AGGR, CAP_AGGR = float(os.environ.get("RISK_D_AGGR", "0.60")), float(os.environ.get("CAP_D_AGGR", "0.02"))
 
 
+# C / D / E became record only on 2026-10-22 and their compounding accounts restart from 100U (cum_U from 0):
+# while the last daily row is the one before the restart, these columns read as fresh.
+RESET_AFTER, RESET_COLS = "10-21", ("D_aggr_eq", "E_aggr_eq", "DW_eq")
+
+
 def last_value(col, default=None):
     """Latest value of a column in records/daily.csv (the D aggressive account is carried there)."""
     p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "records", "daily.csv")
@@ -337,6 +342,8 @@ def last_value(col, default=None):
     if len(lines) < 2 or col not in lines[0].split(","):
         return default
     row, k = lines[-1].split(","), lines[0].split(",").index(col)
+    if col in RESET_COLS and row[0] == RESET_AFTER:
+        return default
     return float(row[k]) if k < len(row) and row[k] else default
 
 
@@ -775,7 +782,7 @@ def daily_summary(meta, d0):
     p = os.path.join(REC, "daily.csv")
     if os.path.exists(p):
         rows = [x.split(",") for x in open(p).read().splitlines()[1:] if x]
-        prev = float(rows[-1][8]) if rows else 0.0
+        prev = float(rows[-1][8]) if rows and rows[-1][0] != RESET_AFTER else 0.0
     day = bj(d0)[:5]
     opened = [f"{m} {x['sym']}（{bj(x['entry_t'])} 入场）" for m, x in (("D", dpos), ("C", cpos)) if x]
     text = (f"📊 昨日战绩 {day}（当天平仓的单，按推送的仓位：{eq:.0f}U，每笔风险 {eq * rl:.0f}U）\n\n"
