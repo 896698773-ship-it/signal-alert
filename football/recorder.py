@@ -146,7 +146,11 @@ KMAX, FOU = 16, 21
 # xa: frozen 2026-10-21 (validated). xa2: relaxed variant frozen 2026-10-21 before any new data was looked at
 # (2nd half from minute 46, gap >= 0.10, line gap up to 1 goal). Both pushed and settled in the daily summary.
 RULES = {"xa": dict(min_minute=61, gap=0.15, lmax=0.5, push=True, name="xa"),
-         "xa2": dict(min_minute=46, gap=0.10, lmax=1.0, push=True, name="xa2 放宽版")}
+         "xa2": dict(min_minute=46, gap=0.10, lmax=1.0, push=True, name="xa2 放宽版"),
+         # the same two rules on youth / women's matches, which the tests left out: pushed and settled apart
+         "xa_y": dict(min_minute=61, gap=0.15, lmax=0.5, push=True, name="xa 青年/女足（未检验）", youth=True),
+         "xa2_y": dict(min_minute=46, gap=0.10, lmax=1.0, push=True, name="xa2 青年/女足（未检验）", youth=True)}
+YOUTH = ("女", "U1", "U2", "青")  # youth and women's matches (reserve teams and friendlies stay out)
 BAD = ("女", "U1", "U2", "青", "后备", "预备", "友谊", "U23", "U20", "U19", "U18", "U17")  # left out of the tested data too
 
 
@@ -455,8 +459,10 @@ if __name__ == "__main__":
                     (playing.add if live_now else playing.discard)(mid)
                 names = "".join(fix.get(mid, (None, "", "", ""))[1:])
                 fired = []
+                youth = any(b in names for b in YOUTH)
+                other_bad = any(b in names for b in BAD) and not youth
                 for rule, cfg in RULES.items():
-                    if (rule, mid) in alerted or not js or any(b in names for b in BAD):
+                    if (rule, mid) in alerted or not js or other_bad or cfg.get("youth", False) != youth:
                         continue
                     x = xa_check(js, cfg["min_minute"], cfg["gap"], cfg["lmax"])
                     if not x:
