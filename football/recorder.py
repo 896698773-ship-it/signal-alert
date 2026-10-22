@@ -336,6 +336,9 @@ def xa_daily(out_dir):
                 alerts.setdefault((r.get("rule") or "xa", r["match_id"]), r)
     bjt = lambda r: datetime.strptime(r["snap_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).astimezone(VNT)
     todays = sorted(((k[0], r) for k, r in alerts.items() if bjt(r).date() == day), key=lambda x: bjt(x[1]))
+    vsrc = [f() for n, f in sorted(files.items()) if n.endswith("_voids.csv.gz")]
+    vsrc += [open(p, "rb").read() for p in sorted(glob.glob(os.path.join(out_dir, "*_voids.csv.gz")))]
+    voids = {r["match_id"] for data in vsrc for r in gz_rows(data)}
     sc = final_scores([day - timedelta(days=1), day, day + timedelta(days=1)]) if todays else {}
     cum = {}
     for n, f in files.items():
@@ -353,6 +356,10 @@ def xa_daily(out_dir):
             nowp = (_num(r["b365_now_line"]), _num(r["b365_now_under"]))
             if not (nowp[0] == nowp[0] and nowp[1] == nowp[1]):  # no current price recorded -> the first quote
                 nowp = first
+            if r["match_id"] in voids:
+                lines.append(f"· {bjt(r):%H:%M} {r['league']} {r['home']} vs {r['away']} {r['home_goals']}:{r['away_goals']}，"
+                             f"{r['goal_min']} 分钟后 → 进球被取消，作废（不算）")
+                continue
             ft = sc.get(r["match_id"])
             pn = _settle(nowp[0], sum(ft), nowp[1], True) if ft else None
             pf = _settle(first[0], sum(ft), first[1], True) if ft else None
@@ -367,7 +374,7 @@ def xa_daily(out_dir):
         bets += mine
         daily.append([tag, rule, len(mine), len(done), round(sn, 4), round(sf, 4)])
         win = sum(1 for b in done if b[-2] > 0.01); push = sum(1 for b in done if abs(b[-2]) <= 0.01)
-        txt = f"【{RULES[rule]['name']}】" + ("昨天没有信号。" if not mine else
+        txt = f"【{RULES[rule]['name']}】" + (("只有作废的信号。" if lines else "昨天没有信号。") if not mine else
                                f"{len(mine)} 注：赢 {win} 走水 {push} 输 {len(done) - win - push}" +
                                (f"，{len(mine) - len(done)} 注没找到比分" if len(done) < len(mine) else "") +
                                f"，合计 {sn:+.2f}U（按进球后第一口价 {sf:+.2f}U）")
@@ -420,16 +427,18 @@ if __name__ == "__main__":
     t0 = time.time()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # a cancelled job still closes its gzip files
     if os.environ.get("GITHUB_EVENT_NAME", "schedule") != "schedule":  # manual start: say it is running
-        tg("⚽ 足球记录器已启动：每分钟盯皇冠和 bet365 的滚球盘。模型 xa 有信号才推送（仅记录，不要下注），"
-           f"每天越南时间 {DAILY_HOUR} 点推昨日总结。")
+        tg("⚽ 足球记录器已启动：下半场每 30 秒、其他每分钟盯皇冠和 bet365 的滚球盘。xa / xa3 / xa2（含青年、女足）有信号就推，"
+           f"每条标明能不能下；进球被取消会再推一条作废；每天越南时间 {DAILY_HOUR} 点推昨日总结。")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
     path, fpath = os.path.join(OUT, f"{stamp}.csv.gz"), os.path.join(OUT, f"{stamp}_fixtures.csv.gz")
     apath = os.path.join(OUT, f"{stamp}_alerts.csv.gz")
+    vpath = os.path.join(OUT, f"{stamp}_voids.csv.gz")
     fix, fix_t, written, seen_fix, alerted, daily_next = {}, 0.0, 0, set(), set(), 0.0
+    alert_goals = {}  # match -> total goals when its alert went out (to spot a goal that is taken back)
     with gzip.open(path, "wt", newline="", encoding="utf-8") as f, gzip.open(fpath, "wt", newline="", encoding="utf-8") as ff, \
-            gzip.open(apath, "wt", newline="", encoding="utf-8") as fa:
-        w, wf, wa = csv.writer(f), csv.writer(ff), csv.writer(fa)
-        w.writerow(COLS); wf.writerow(FIX_COLS); wa.writerow(ALERT_COLS)
+            gzip.open(apath, "wt", newline="", encoding="utf-8") as fa, gzip.open(vpath, "wt", newline="", encoding="utf-8") as fv:
+        w, wf, wa, wv = csv.writer(f), csv.writer(ff), csv.writer(fa), csv.writer(fv)
+        w.writerow(COLS); wf.writerow(FIX_COLS); wa.writerow(ALERT_COLS); wv.writerow(["snap_utc", "match_id", "alert_goals", "now_goals"])
         last_full, prev, active, slow_until, playing, sig, half2, rnd = 0.0, {}, set(), 0.0, set(), {}, set(), 0
         while time.time() - t0 < DURATION:
             round_t = time.time()
@@ -462,6 +471,14 @@ if __name__ == "__main__":
             for (mid, trig), (rows, js) in zip(todo, res):
                 for row in rows:
                     w.writerow([snap_utc, *row, trig]); n += 1
+                if rows and mid in alert_goals:  # both books now show fewer goals than at the alert: the goal was taken back
+                    now_g = [_gn(r[3]) + _gn(r[4]) for r in rows if r[3] not in (None, "")]
+                    if now_g and max(now_g) < alert_goals[mid]:
+                        wv.writerow([snap_utc, mid, alert_goals[mid], max(now_g)]); fv.flush()
+                        kt, lg, hn, an = fix.get(mid, (None, "", "", ""))
+                        tg(f"⚠️ 进球被取消：{lg} {hn} vs {an} 比分退回 {rows[0][3]}:{rows[0][4]}。之前那条小球信号作废，"
+                           f"没下就别下了；下了的话 bet365 一般会把这段时间的注单作废退款，以平台规则为准（越南时间 {datetime.now(VNT):%H:%M}）")
+                        del alert_goals[mid]
                 if any(r[10] not in (None, "") and str(r[2]) not in ("早餐", "未开场") for r in rows):
                     active.add(mid)  # has an in-play full-time line -> worth a look every minute
                 if rows:  # still playing: an in-play row whose prices changed within the last 10 minutes
@@ -482,6 +499,7 @@ if __name__ == "__main__":
                     if not x:
                         continue
                     alerted.add((rule, mid))
+                    alert_goals[mid] = x["h"] + x["a"]
                     kt, lg, hn, an = fix.get(mid, (None, "", "", ""))
                     wa.writerow([snap_utc, mid, lg, hn, an, x["h"], x["a"], x["gm"], *x["c"], *x["b"], round(x["lc"], 3),
                                  round(x["lb"], 3), *x["c_now"], *x["b_now"], rule]); fa.flush()
