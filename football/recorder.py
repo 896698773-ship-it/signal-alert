@@ -415,7 +415,7 @@ if __name__ == "__main__":
             gzip.open(apath, "wt", newline="", encoding="utf-8") as fa:
         w, wf, wa = csv.writer(f), csv.writer(ff), csv.writer(fa)
         w.writerow(COLS); wf.writerow(FIX_COLS); wa.writerow(ALERT_COLS)
-        last_full, prev, active, slow_until = 0.0, {}, set(), 0.0
+        last_full, prev, active, slow_until, playing, sig = 0.0, {}, set(), 0.0, set(), {}
         while time.time() - t0 < DURATION:
             round_t = time.time()
             now = datetime.now(BJT)
@@ -432,7 +432,8 @@ if __name__ == "__main__":
                 live = {mid for mid, (kt, *_r) in fix.items() if kt - timedelta(minutes=2) <= now <= kt + timedelta(minutes=130)} | in_play
                 todo = [(mid, "goal" if mid in goal else "5min") for mid in sorted(live)]
             elif time.time() >= slow_until:
-                todo = [(mid, "goal" if mid in goal else "1min") for mid in sorted(active & in_play)]
+                # in play per the live list, or per the match's own last snapshot (some leagues are not in the list)
+                todo = [(mid, "goal" if mid in goal else "1min") for mid in sorted(active & (in_play | playing))]
             else:
                 todo = []
             done_ids = {m for m, _ in todo}
@@ -446,6 +447,12 @@ if __name__ == "__main__":
                     w.writerow([snap_utc, *row, trig]); n += 1
                 if any(r[10] not in (None, "") and str(r[2]) not in ("早餐", "未开场") for r in rows):
                     active.add(mid)  # has an in-play full-time line -> worth a look every minute
+                if rows:  # still playing: an in-play row whose prices changed within the last 10 minutes
+                    key = tuple(map(str, sum(rows, [])))
+                    if sig.get(mid, (None,))[0] != key:
+                        sig[mid] = (key, time.time())
+                    live_now = any(r[5] in (1, 2, 3) for r in rows) and time.time() - sig[mid][1] < 600
+                    (playing.add if live_now else playing.discard)(mid)
                 names = "".join(fix.get(mid, (None, "", "", ""))[1:])
                 for rule, cfg in RULES.items():
                     if (rule, mid) in alerted or not js or any(b in names for b in BAD):
