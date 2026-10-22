@@ -144,9 +144,9 @@ def snap(mid):
 # Same definitions as search_kanpan/goal/frozen_xa_b365gen.py; first qualifying goal per match only.
 KMAX, FOU = 16, 21
 # xa: frozen 2026-10-21 (validated). xa2: relaxed variant frozen 2026-10-21 before any new data was looked at
-# (2nd half from minute 46, gap >= 0.10, line gap up to 1 goal); recorded only, shown in the daily summary.
-RULES = {"xa": dict(min_minute=61, gap=0.15, lmax=0.5, push=True),
-         "xa2": dict(min_minute=46, gap=0.10, lmax=1.0, push=False)}
+# (2nd half from minute 46, gap >= 0.10, line gap up to 1 goal). Both pushed and settled in the daily summary.
+RULES = {"xa": dict(min_minute=61, gap=0.15, lmax=0.5, push=True, name="xa"),
+         "xa2": dict(min_minute=46, gap=0.10, lmax=1.0, push=True, name="xa2 放宽版")}
 BAD = ("女", "U1", "U2", "青", "后备", "预备", "友谊", "U23", "U20", "U19", "U18", "U17")  # left out of the tested data too
 
 
@@ -352,7 +352,7 @@ def xa_daily(out_dir):
         bets += mine
         daily.append([tag, rule, len(mine), len(done), round(sn, 4), round(sf, 4)])
         win = sum(1 for b in done if b[-2] > 0.01); push = sum(1 for b in done if abs(b[-2]) <= 0.01)
-        txt = f"【{rule}】" + ("昨天没有信号。" if not mine else
+        txt = f"【{RULES[rule]['name']}】" + ("昨天没有信号。" if not mine else
                                f"{len(mine)} 注：赢 {win} 走水 {push} 输 {len(done) - win - push}" +
                                (f"，{len(mine) - len(done)} 注没找到比分" if len(done) < len(mine) else "") +
                                f"，合计 {sn:+.2f}U（按进球后第一口价 {sf:+.2f}U）")
@@ -370,7 +370,7 @@ def xa_daily(out_dir):
         wd = csv.writer(fd)
         wd.writerow(["date", "rule", "alerts", "settled", "pnl_now", "pnl_first"])
         wd.writerows(daily)
-    tg(f"📊 小球模型昨日记录 {day:%m-%d}（仅记录，每注 1U，按推送时 bet365 的价；xa2 = 放宽版，只记录不推送）\n\n"
+    tg(f"📊 小球模型昨日记录 {day:%m-%d}（仅记录，每注 1U，按推送时 bet365 的价；xa2 = 放宽版，同一场两条都中只算各自一注）\n\n"
        + "\n\n".join(parts))
     return True
 
@@ -454,6 +454,7 @@ if __name__ == "__main__":
                     live_now = any(r[5] in (1, 2, 3) for r in rows) and time.time() - sig[mid][1] < 600
                     (playing.add if live_now else playing.discard)(mid)
                 names = "".join(fix.get(mid, (None, "", "", ""))[1:])
+                fired = []
                 for rule, cfg in RULES.items():
                     if (rule, mid) in alerted or not js or any(b in names for b in BAD):
                         continue
@@ -464,10 +465,17 @@ if __name__ == "__main__":
                     kt, lg, hn, an = fix.get(mid, (None, "", "", ""))
                     wa.writerow([snap_utc, mid, lg, hn, an, x["h"], x["a"], x["gm"], *x["c"], *x["b"], round(x["lc"], 3),
                                  round(x["lb"], 3), *x["c_now"], *x["b_now"], rule]); fa.flush()
-                    bn = x["b_now"]
                     if cfg["push"]:
-                        tg(f"🧪 小球模型 {rule}（仅记录，不要下注）\n{lg} {hn} vs {an}  {x['h']}:{x['a']}，{x['gm']} 分钟进球后\n"
-                           f"bet365 第一口：全场 {x['b'][1]:g} 小 {x['b'][2]:.2f}｜皇冠第一口：{x['c'][1]:g} 小 {x['c'][2]:.2f}\n"
+                        fired.append((cfg["name"], x, lg, hn, an))
+                if fired:  # one message per match and goal, naming every rule that fired on it
+                    by_goal = {}
+                    for nm, x, lg, hn, an in fired:
+                        by_goal.setdefault((x["h"], x["a"]), []).append((nm, x, lg, hn, an))
+                    for group in by_goal.values():
+                        _, x, lg, hn, an = group[0]
+                        bn = x["b_now"]
+                        tg(f"🧪 小球模型 {' + '.join(g[0] for g in group)}（仅记录，不要下注）\n{lg} {hn} vs {an}  {x['h']}:{x['a']}，"
+                           f"{x['gm']} 分钟进球后\nbet365 第一口：全场 {x['b'][1]:g} 小 {x['b'][2]:.2f}｜皇冠第一口：{x['c'][1]:g} 小 {x['c'][2]:.2f}\n"
                            f"→ bet365 全场小" + (f"，现在 {bn[1]:g} 小 {bn[2]:.2f}" if bn[1] is not None else "") +
                            f"\n（北京时间 {datetime.now(BJT):%H:%M}）")
                 if rows and mid not in seen_fix and mid in fix:
