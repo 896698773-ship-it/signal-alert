@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 BJT = timezone(timedelta(hours=8))
+VNT = timezone(timedelta(hours=7))  # the user's clock: pushes, daily summary and its day are in Vietnam time
 BASE = "https://bf.titan007.com"
 OUT = sys.argv[1] if len(sys.argv) > 1 else "out"
 DURATION = int(os.environ.get("DURATION", "19800"))
@@ -260,7 +261,7 @@ def tg(text):
 
 
 # ---------------------------------------------------------------- daily summary of the record-only alerts
-DAILY_HOUR = 10  # Beijing time; every match alerted the day before has finished by then
+DAILY_HOUR = 10  # Vietnam time; every match alerted the day before has finished by then
 
 
 def git(*a):
@@ -308,8 +309,8 @@ def final_scores(days):
 
 
 def xa_daily(out_dir):
-    """Settle yesterday's (Beijing date) alerts of every rule and send the summary once. True when done (or already)."""
-    day = (datetime.now(BJT) - timedelta(days=1)).date()
+    """Settle yesterday's (Vietnam date) alerts of every rule and send the summary once. True when done (or already)."""
+    day = (datetime.now(VNT) - timedelta(days=1)).date()
     tag = f"{day:%Y%m%d}"
     if os.path.exists(os.path.join(out_dir, f"xa_daily_{tag}.csv.gz")):
         return True
@@ -323,7 +324,7 @@ def xa_daily(out_dir):
         for r in gz_rows(data):
             if r.get("match_id"):
                 alerts.setdefault((r.get("rule") or "xa", r["match_id"]), r)
-    bjt = lambda r: datetime.strptime(r["snap_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).astimezone(BJT)
+    bjt = lambda r: datetime.strptime(r["snap_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).astimezone(VNT)
     todays = sorted(((k[0], r) for k, r in alerts.items() if bjt(r).date() == day), key=lambda x: bjt(x[1]))
     sc = final_scores([day - timedelta(days=1), day, day + timedelta(days=1)]) if todays else {}
     cum = {}
@@ -374,7 +375,7 @@ def xa_daily(out_dir):
         wd = csv.writer(fd)
         wd.writerow(["date", "rule", "alerts", "settled", "pnl_now", "pnl_first"])
         wd.writerows(daily)
-    tg(f"📊 小球模型昨日记录 {day:%m-%d}（仅记录，每注 1U，按推送时 bet365 的价；xa2 = 放宽版，同一场两条都中只算各自一注）\n\n"
+    tg(f"📊 小球模型昨日记录 {day:%m-%d}（越南时间；仅记录，每注 1U，按推送时 bet365 的价；xa2 = 放宽版，同一场两条都中只算各自一注）\n\n"
        + "\n\n".join(parts))
     return True
 
@@ -410,7 +411,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # a cancelled job still closes its gzip files
     if os.environ.get("GITHUB_EVENT_NAME", "schedule") != "schedule":  # manual start: say it is running
         tg("⚽ 足球记录器已启动：每分钟盯皇冠和 bet365 的滚球盘。模型 xa 有信号才推送（仅记录，不要下注），"
-           f"每天 {DAILY_HOUR} 点推昨日总结。")
+           f"每天越南时间 {DAILY_HOUR} 点推昨日总结。")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
     path, fpath = os.path.join(OUT, f"{stamp}.csv.gz"), os.path.join(OUT, f"{stamp}_fixtures.csv.gz")
     apath = os.path.join(OUT, f"{stamp}_alerts.csv.gz")
@@ -483,7 +484,7 @@ if __name__ == "__main__":
                         tg(f"🧪 小球模型 {' + '.join(g[0] for g in group)}（仅记录，不要下注）\n{lg} {hn} vs {an}  {x['h']}:{x['a']}，"
                            f"{x['gm']} 分钟进球后\nbet365 第一口：全场 {x['b'][1]:g} 小 {x['b'][2]:.2f}｜皇冠第一口：{x['c'][1]:g} 小 {x['c'][2]:.2f}\n"
                            f"→ bet365 全场小" + (f"，现在 {bn[1]:g} 小 {bn[2]:.2f}" if bn[1] is not None else "") +
-                           f"\n（北京时间 {datetime.now(BJT):%H:%M}）")
+                           f"\n（越南时间 {datetime.now(VNT):%H:%M}）")
                 if rows and mid not in seen_fix and mid in fix:
                     kt, lg, h, a = fix[mid]
                     wf.writerow([mid, kt.strftime("%Y-%m-%d %H:%M"), lg, h, a]); seen_fix.add(mid)
@@ -495,10 +496,10 @@ if __name__ == "__main__":
             if todo and (full_round or goal):
                 print(f"{now:%m-%d %H:%M} BJT  本轮 {len(todo)} 场（进球后补扫 {len(goal)}），记录 {n} 行（累计 {written}），"
                       f"用时 {time.time() - round_t:.0f} 秒", flush=True)
-            if datetime.now(BJT).hour >= DAILY_HOUR and time.time() >= daily_next:
+            if datetime.now(VNT).hour >= DAILY_HOUR and time.time() >= daily_next:
                 try:
                     if xa_daily(OUT):  # done for yesterday: look again after the next midnight
-                        nxt = (datetime.now(BJT) + timedelta(days=1)).replace(hour=DAILY_HOUR, minute=0, second=0)
+                        nxt = (datetime.now(VNT) + timedelta(days=1)).replace(hour=DAILY_HOUR, minute=0, second=0)
                         daily_next = nxt.timestamp()
                 except Exception as e:  # noqa: BLE001 - the summary must never stop the recording
                     print("daily summary failed:", e, flush=True)
