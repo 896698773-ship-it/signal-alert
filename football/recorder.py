@@ -146,11 +146,20 @@ def snap(mid):
 KMAX, FOU = 16, 21
 # xa: frozen 2026-10-21 (validated). xa2: relaxed variant frozen 2026-10-21 before any new data was looked at
 # (2nd half from minute 46, gap >= 0.10, line gap up to 1 goal). Both pushed and settled in the daily summary.
-RULES = {"xa": dict(min_minute=61, gap=0.15, lmax=0.5, push=True, name="xa"),
-         "xa2": dict(min_minute=46, gap=0.10, lmax=1.0, push=True, name="xa2 放宽版"),
-         # the same two rules on youth / women's matches (tested on their own 2026-10-22: xa +10.5% on 507, xa2 +5.5% on 2035): settled apart
-         "xa_y": dict(min_minute=61, gap=0.15, lmax=0.5, push=True, name="xa 青年/女足", youth=True),
-         "xa2_y": dict(min_minute=46, gap=0.10, lmax=1.0, push=True, name="xa2 青年/女足", youth=True)}
+RULES = {
+    "xa": dict(min_minute=61, gap=0.15, lmax=0.5, push=True, name="xa",
+               tag="🟢 xa：回测 1,633 注每注 +14.7%（6 段历史全赚）→ 可小注试：每注 1% 本金，只在 bet365 下"),
+    # xa3 frozen 2026-10-22 before Mar-Aug 2025 was downloaded; scored once there: +18.0% on 439 bets
+    "xa3": dict(min_minute=46, gap=0.20, lmax=1.0, push=True, name="xa3",
+                tag="🟢 xa3（价差 ≥0.20）：新数据 439 注每注 +18.0%（6 个月全赚）→ 可小注试：每注 1% 本金，只在 bet365 下"),
+    "xa2": dict(min_minute=46, gap=0.10, lmax=1.0, push=True, name="xa2 放宽版",
+                tag="⚪ xa2 放宽版：回测 8,804 注每注 +5.7%，太薄，价格一变差就不赚 → 只记录，不建议下"),
+    # the same rules on youth / women's matches (tested on their own 2026-10-22: xa +10.5% on 507, xa2 +5.5% on 2035): settled apart
+    "xa_y": dict(min_minute=61, gap=0.15, lmax=0.5, push=True, name="xa 青年/女足", youth=True,
+                 tag="🟡 xa 青年/女足：回测 507 注每注 +10.5%（女足 +17%，青年 +5.5%）→ 女足可小注，青年只记录"),
+    "xa2_y": dict(min_minute=46, gap=0.10, lmax=1.0, push=True, name="xa2 青年/女足", youth=True,
+                  tag="⚪ xa2 青年/女足：回测 2,035 注每注 +5.5% → 只记录，不建议下"),
+}
 YOUTH = ("女", "U1", "U2", "青")  # youth and women's matches (reserve teams and friendlies stay out)
 BAD = ("女", "U1", "U2", "青", "后备", "预备", "友谊", "U23", "U20", "U19", "U18", "U17")  # left out of the tested data too
 
@@ -376,7 +385,7 @@ def xa_daily(out_dir):
         wd = csv.writer(fd)
         wd.writerow(["date", "rule", "alerts", "settled", "pnl_now", "pnl_first"])
         wd.writerows(daily)
-    tg(f"📊 小球模型昨日记录 {day:%m-%d}（越南时间；仅记录，每注 1U，按推送时 bet365 的价；xa2 = 放宽版，同一场两条都中只算各自一注）\n\n"
+    tg(f"📊 小球模型昨日记录 {day:%m-%d}（越南时间；每注 1U，按推送时 bet365 的价结算；🟢 xa / xa3 可小注，⚪ xa2 只记录；同一场几条都中，各自算一注）\n\n"
        + "\n\n".join(parts))
     return True
 
@@ -485,10 +494,19 @@ if __name__ == "__main__":
                     for group in by_goal.values():
                         _, x, lg, hn, an = group[0]
                         bn = x["b_now"]
-                        tg(f"🧪 小球模型 {' + '.join(g[0] for g in group)}（仅记录，不要下注）\n{lg} {hn} vs {an}  {x['h']}:{x['a']}，"
+                        tags = [RULES[k]["tag"] for k in RULES if RULES[k]["name"] in {g[0] for g in group}]
+                        need = min(RULES[k]["gap"] for k in RULES if RULES[k]["name"] in {g[0] for g in group})
+                        cn, gl = x["c_now"], x["h"] + x["a"]  # the gap again at the prices showing now (not tested; a guide)
+                        lc2 = lam_rem(*cn, gl) if None not in cn and all(v == v for v in cn) else None
+                        lb2 = lam_rem(*bn, gl) if None not in bn and all(v == v for v in bn) else None
+                        if lc2 is not None and lb2 is not None:
+                            tags.append(f"现在两家价差 {lb2 - lc2:+.2f}（模型要求 ≥{need:.2f}）"
+                                        + ("" if lb2 - lc2 >= need else "：⚠️ 已经不够，这注别追"))
+                        tg(f"⚽ 小球信号：{' + '.join(g[0] for g in group)}\n{lg} {hn} vs {an}  {x['h']}:{x['a']}，"
                            f"{x['gm']} 分钟进球后\nbet365 第一口：全场 {x['b'][1]:g} 小 {x['b'][2]:.2f}｜皇冠第一口：{x['c'][1]:g} 小 {x['c'][2]:.2f}\n"
                            f"→ bet365 全场小" + (f"，现在 {bn[1]:g} 小 {bn[2]:.2f}" if bn[1] is not None else "") +
-                           f"\n（越南时间 {datetime.now(VNT):%H:%M}）")
+                           "\n" + "\n".join(tags) +
+                           f"\n下了的话记下实际成交的盘口和水位（越南时间 {datetime.now(VNT):%H:%M}）")
                 if rows and mid not in seen_fix and mid in fix:
                     kt, lg, h, a = fix[mid]
                     wf.writerow([mid, kt.strftime("%Y-%m-%d %H:%M"), lg, h, a]); seen_fix.add(mid)
