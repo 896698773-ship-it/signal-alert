@@ -10,6 +10,9 @@ match, also written to <out>/<UTC run start>_alerts.csv.gz with the prices at th
 Beijing time the previous day's alerts (this job's and earlier jobs' on the football-data branch) are settled on the
 final scores and a daily summary is sent (xa_daily_<date>.csv.gz / xa_bets_<date>.csv.gz record it).
 
+Watch-only push (not yet tested): the frozen first-half rule LIVE_HT_UNDER (Crown's first-half O/U falling faster than
+the clock) is pushed once per match and written to <out>/<UTC run start>_hu.csv.gz; it is scored on these files later.
+
 Jobs hand over: once a later run of the workflow is waiting (or DURATION is up, when the job starts the next run
 itself) the job ends after a round, so recording continues with about a minute's gap."""
 import csv, glob, gzip, io, math, os, re, signal, subprocess, sys, time, json
@@ -253,6 +256,77 @@ def xa_check(js, min_minute=61, gap=0.15, lmax=0.5):
     return first
 
 
+# ---------------------------------------------------------------- frozen rule LIVE_HT_UNDER (watch only, not yet tested)
+# Frozen 2026-10-21 (my-first-project scans/2026-10-21/kanpan/live/PREREG_live.md, live_patterns.py) and scored there
+# once on these recorder files after 14 recorded days. Crown's first-half O/U implies at least 10% fewer remaining
+# first-half goals (log) than time decay alone would give over a 4-7 minute window at an unchanged score, at minute
+# 10-35 of the first half -> first-half under at Crown. One per match. Same definitions as live_patterns.py.
+HALF_TAU = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45]
+HALF_F = [0.0, -0.11478, -0.21928, -0.3476, -0.48897, -0.66022, -0.84396, -1.09617, -1.20632, -1.31647]
+HU_TAG = "⚪ 半场小观察：规则 10-21 已写死，正在用实盘数据考试（约 11 月 3 日出结果）→ 只观察，不建议下"
+HU_COLS = ["snap_utc", "match_id", "league", "home", "away", "home_goals", "away_goals", "tau1", "tau2", "L1", "o1", "u1",
+           "L2", "o2", "u2", "lam1", "lam2", "dev", "b365_L", "b365_o", "b365_u"]
+hu_hist = {}  # match -> this run's Crown snapshots in play: dict(t, tau, g, ok, o, L, u, lam, key)
+
+
+def _fh(tau):
+    x = min(tau, 45.0)
+    for i in range(1, len(HALF_TAU)):
+        if x <= HALF_TAU[i]:
+            a, b = HALF_TAU[i - 1], HALF_TAU[i]
+            return HALF_F[i - 1] + (HALF_F[i] - HALF_F[i - 1]) * (x - a) / (b - a)
+    return HALF_F[-1]
+
+
+def _fnum(x):
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def hu_check(mid, rows, t):
+    """This snapshot's LIVE_HT_UNDER signal for the match, or None (rows: snap() rows of one snapshot, t: its UTC time)."""
+    cr = next((r for r in rows if r[1] == "crown"), None)
+    if cr is None or cr[5] not in (1, 2, 3):
+        return None
+    st, label, g = cr[5], str(cr[2]), _gn(cr[3]) + _gn(cr[4])
+    m = 45.5 if label == "中场" else _fnum(label)
+    tau = None if m is None else (45.5 if label == "中场" and st == 2 else None if label == "中场" or st not in (1, 3)
+                                  else min(m, 45.0) if st == 1 else max(m, 46.0))
+    # the two books' rows disagree on the score (one lags a goal): unusable
+    conflict = len({(_gn(r[3]), _gn(r[4])) for r in rows if r[5] in (1, 2, 3)}) > 1
+    o, L, u = (_fnum(x) for x in cr[6:9])
+    lam = None
+    if st == 1 and tau is not None and None not in (o, L, u) and 0.40 <= o <= 2.00 and 0.40 <= u <= 2.00 and not conflict:
+        lam = lam_rem(o, L, u, g)
+        lam = lam if lam is not None and 0.006 <= lam <= 8.9 else None
+    cur = dict(t=t, tau=tau, g=g, ok=lam is not None, o=o, L=L, u=u, lam=lam,
+               key=(label, g, st, tuple(_fnum(x) for x in cr[6:18])))
+    hist = hu_hist.setdefault(mid, [])
+    best = None
+    for s0 in reversed(hist):
+        dt = (t - s0["t"]).total_seconds() / 60
+        if dt > 7.0:
+            break
+        if dt < 4.0 or s0["g"] != g or not s0["ok"]:
+            continue
+        if best is None or abs(dt - 5.0) < abs((t - best["t"]).total_seconds() / 60 - 5.0):
+            best = s0
+    hist.append(cur)
+    hu_hist[mid] = [s for s in hist if (t - s["t"]).total_seconds() <= 600]
+    if not cur["ok"] or best is None or best["key"] == cur["key"] or (best["tau"] == 45.0 and tau == 45.0) \
+            or tau < best["tau"] or abs(L - best["L"]) >= 0.75 - 1e-9:
+        return None
+    dev = round(math.log(lam / (best["lam"] * math.exp(_fh(tau) - _fh(best["tau"])))), 4)
+    if dev > -0.10 or not 10.0 <= tau <= 35.0:
+        return None
+    b = next((r for r in rows if r[1] == "b365"), None)
+    bq = tuple(_fnum(x) for x in b[6:9]) if b is not None and (_gn(b[3]), _gn(b[4])) == (_gn(cr[3]), _gn(cr[4])) else (None,) * 3
+    return dict(h=_gn(cr[3]), a=_gn(cr[4]), s1=best, s2=cur, dev=dev, b=bq)
+
+
 def tg(text):
     tok, chat = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
     if not tok or not chat:
@@ -428,17 +502,21 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # a cancelled job still closes its gzip files
     if os.environ.get("GITHUB_EVENT_NAME", "schedule") != "schedule":  # manual start: say it is running
         tg("⚽ 足球记录器已启动：下半场每 30 秒、其他每分钟盯皇冠和 bet365 的滚球盘。xa / xa3 / xa2（含青年、女足）有信号就推，"
-           f"每条标明能不能下；进球被取消会再推一条作废；每天越南时间 {DAILY_HOUR} 点推昨日总结。")
+           f"每条标明能不能下；半场小观察（未验证）也推，只看不下；进球被取消会再推一条作废；每天越南时间 {DAILY_HOUR} 点推昨日总结。")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
     path, fpath = os.path.join(OUT, f"{stamp}.csv.gz"), os.path.join(OUT, f"{stamp}_fixtures.csv.gz")
     apath = os.path.join(OUT, f"{stamp}_alerts.csv.gz")
     vpath = os.path.join(OUT, f"{stamp}_voids.csv.gz")
+    hpath = os.path.join(OUT, f"{stamp}_hu.csv.gz")
     fix, fix_t, written, seen_fix, alerted, daily_next = {}, 0.0, 0, set(), set(), 0.0
+    hu_sent = set()
     alert_goals = {}  # match -> total goals when its alert went out (to spot a goal that is taken back)
     with gzip.open(path, "wt", newline="", encoding="utf-8") as f, gzip.open(fpath, "wt", newline="", encoding="utf-8") as ff, \
-            gzip.open(apath, "wt", newline="", encoding="utf-8") as fa, gzip.open(vpath, "wt", newline="", encoding="utf-8") as fv:
-        w, wf, wa, wv = csv.writer(f), csv.writer(ff), csv.writer(fa), csv.writer(fv)
+            gzip.open(apath, "wt", newline="", encoding="utf-8") as fa, gzip.open(vpath, "wt", newline="", encoding="utf-8") as fv, \
+            gzip.open(hpath, "wt", newline="", encoding="utf-8") as fh:
+        w, wf, wa, wv, wh = csv.writer(f), csv.writer(ff), csv.writer(fa), csv.writer(fv), csv.writer(fh)
         w.writerow(COLS); wf.writerow(FIX_COLS); wa.writerow(ALERT_COLS); wv.writerow(["snap_utc", "match_id", "alert_goals", "now_goals"])
+        wh.writerow(HU_COLS)
         last_full, prev, active, slow_until, playing, sig, half2, rnd = 0.0, {}, set(), 0.0, set(), {}, set(), 0
         while time.time() - t0 < DURATION:
             round_t = time.time()
@@ -464,7 +542,8 @@ if __name__ == "__main__":
                 todo = []
             done_ids = {m for m, _ in todo}
             todo += [(mid, "goal") for mid in goal if mid not in done_ids]
-            snap_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            snap_dt = datetime.now(timezone.utc).replace(microsecond=0)
+            snap_utc = snap_dt.strftime("%Y-%m-%d %H:%M:%S")
             with ThreadPoolExecutor(5) as ex:
                 res = list(ex.map(lambda x: snap(x[0]), todo))
             n = 0
@@ -488,6 +567,19 @@ if __name__ == "__main__":
                     live_now = any(r[5] in (1, 2, 3) for r in rows) and time.time() - sig[mid][1] < 600
                     (playing.add if live_now else playing.discard)(mid)
                     (half2.add if live_now and any(r[5] == 3 for r in rows) else half2.discard)(mid)
+                hu = hu_check(mid, rows, snap_dt) if rows and mid not in hu_sent else None
+                if hu:
+                    hu_sent.add(mid)
+                    kt, lg, hn, an = fix.get(mid, (None, "", "", ""))
+                    s1, s2, bq = hu["s1"], hu["s2"], hu["b"]
+                    wh.writerow([snap_utc, mid, lg, hn, an, hu["h"], hu["a"], s1["tau"], s2["tau"], s1["L"], s1["o"], s1["u"],
+                                 s2["L"], s2["o"], s2["u"], round(s1["lam"], 4), round(s2["lam"], 4), hu["dev"], *bq]); fh.flush()
+                    exp_lam = s2["lam"] / math.exp(hu["dev"])
+                    tg(f"👀 半场小观察（未验证）\n{lg} {hn} vs {an}  {hu['h']}:{hu['a']}，{s2['tau']:.0f} 分钟\n"
+                       f"皇冠半场大小：{s1['tau']:.0f} 分钟 {s1['L']:g} 小 {s1['u']:.2f} → 现在 {s2['L']:g} 小 {s2['u']:.2f}\n"
+                       f"只算时间应该还剩 {exp_lam:.2f} 球，皇冠现在只给 {s2['lam']:.2f} 球（多降 {1 - math.exp(hu['dev']):.0%}）\n"
+                       f"→ 皇冠半场小 {s2['L']:g} 水 {s2['u']:.2f}" + (f"｜bet365 现在 {bq[1]:g} 小 {bq[2]:.2f}" if None not in bq else "") +
+                       f"\n{HU_TAG}（越南时间 {datetime.now(VNT):%H:%M}）")
                 names = "".join(fix.get(mid, (None, "", "", ""))[1:])
                 fired = []
                 youth = any(b in names for b in YOUTH)
