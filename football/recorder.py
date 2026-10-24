@@ -591,6 +591,8 @@ if __name__ == "__main__":
                        f"皇冠半场大小：{s1['tau']:.0f} 分钟 {s1['L']:g} 小 {s1['u']:.2f} → 现在 {s2['L']:g} 小 {s2['u']:.2f}\n"
                        f"只算时间应该还剩 {exp_lam:.2f} 球，皇冠现在只给 {s2['lam']:.2f} 球（多降 {1 - math.exp(hu['dev']):.0%}）\n"
                        f"→ 皇冠半场小 {s2['L']:g} 水 {s2['u']:.2f}" + (f"｜bet365 现在 {bq[1]:g} 小 {bq[2]:.2f}" if None not in bq else "") +
+                       # bet365 a goal or more away from Crown at the same score: it is pricing a goal not (yet) given
+                       ("（bet365 跟皇冠差一个球以上，像是在等进球判定，先别看 bet365）" if None not in bq and abs(bq[1] - s2["L"]) >= 0.75 else "") +
                        f"\n{HU_RULES[rule]['tag']}（越南时间 {datetime.now(VNT):%H:%M}）")
                 names = "".join(fix.get(mid, (None, "", "", ""))[1:])
                 fired = []
