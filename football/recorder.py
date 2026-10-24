@@ -341,7 +341,18 @@ def hu_check(mid, rows, t, sent=()):
     return out
 
 
-def tg(text):
+def tg(text, limit=4000):
+    if len(text) > limit:  # Telegram takes up to 4096 characters a message: send longer texts in parts, split on lines
+        part = ""
+        for line in text.split("\n"):
+            if part and len(part) + 1 + len(line) > limit:
+                tg(part, limit)
+                part = line
+            else:
+                part = f"{part}\n{line}" if part else line
+        if part:
+            tg(part[:limit], limit)
+        return
     tok, chat = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
     if not tok or not chat:
         print(text, flush=True)
@@ -492,37 +503,43 @@ def xa_daily(out_dir):
         wd = csv.writer(fd)
         wd.writerow(["date", "rule", "alerts", "settled", "pnl_now", "pnl_first"])
         wd.writerows(daily)
-    tg(f"📊 小球模型昨日记录 {day:%m-%d}（越南时间；每注 1U，按推送时 bet365 的价结算；🟢 xa / xa3 可小注，⚪ xa2 只记录；同一场几条都中，各自算一注）\n\n"
-       + "\n\n".join(parts))
-    # the first-half under watch pushes: settled on the half-time score at Crown's price at the push; summary only
-    # (a list would not fit one message), each bet in hu_bets_<date>.csv.gz, the totals in hu_daily_<date>.csv.gz
+    # the first-half under watch rules: settled on the half-time score at Crown's price at the push; the pushed one
+    # (the early version) is listed bet by bet in the same message, the original one is only recorded (not shown);
+    # each bet goes to hu_bets_<date>.csv.gz and the totals of both to hu_daily_<date>.csv.gz
     hcum = {}
     for n, f in files.items():
         if n.startswith("hu_daily_") and n < f"hu_daily_{tag}":
             for r in gz_rows(f()):
                 c = hcum.setdefault(r["rule"], [0, 0.0]); c[0] += int(r["settled"]); c[1] += float(r["pnl"])
-    hparts, hdaily, hbets = [], [], []
+    hdaily, hbets = [], []
     for rule, cfg in HU_RULES.items():
         mine = [r for rl, r in hu_today if rl == rule]
-        done = []
-        for r in mine:
+        done, lines = [], []
+        for r in sorted(mine, key=bjt):
             k = ht.get(r["match_id"])
             pn = _settle(_num(r["L2"]), sum(k), _num(r["u2"]), True) if k else None
             hbets.append([tag, rule, r["match_id"], r["league"], r["home"], r["away"], r["tau2"], r["L2"], r["u2"],
                           *(k or ("", "")), "" if pn is None else round(pn, 4)])
             if pn is not None:
                 done.append(pn)
+            res = "未找到半场比分" if k is None else f"半场 {k[0]}:{k[1]} " + ("赢" if pn > 0.01 else "走水" if abs(pn) <= 0.01 else "输") + f" {pn:+.2f}"
+            lines.append(f"· {bjt(r):%H:%M} {r['league']} {r['home']} vs {r['away']} {r['home_goals']}:{r['away_goals']}，"
+                         f"{float(r['tau2']):.0f} 分钟 半场小 {_num(r['L2']):g}@{_num(r['u2']):.2f} → {res}")
         sn = sum(done)
         c = hcum.setdefault(rule, [0, 0.0]); c[0] += len(done); c[1] += sn
         hdaily.append([tag, rule, len(mine), len(done), round(sn, 4)])
         win = sum(1 for x in done if x > 0.01); push = sum(1 for x in done if abs(x) <= 0.01)
-        txt = f"【{cfg['title'].replace('👀 ', '').replace('（未验证）', '')}{'' if cfg['push'] else '（不推送，只记录）'}】" + ("昨天没有推送。" if not mine else
+        if not cfg["push"]:
+            continue
+        txt = f"【{cfg['title'].replace('👀 ', '').replace('（未验证）', '')}（未验证，只观察不下；按推送时皇冠半场小的价、半场比分结算）】" + ("昨天没有推送。" if not mine else
                                                         f"{len(mine)} 注：赢 {win} 走水 {push} 输 {len(done) - win - push}" +
                                                         (f"，{len(mine) - len(done)} 注没找到半场比分" if len(done) < len(mine) else "") +
                                                         f"，合计 {sn:+.2f}U" + (f"，每注 {sn / len(done):+.1%}" if done else ""))
+        if lines:
+            txt += "\n" + "\n".join(lines)
         if c[0]:
             txt += f"\n上线以来 {c[0]} 注，合计 {c[1]:+.2f}U，每注 {c[1] / c[0]:+.1%}"
-        hparts.append(txt)
+        parts.append(txt)
     with gzip.open(os.path.join(out_dir, f"hu_bets_{tag}.csv.gz"), "wt", newline="", encoding="utf-8") as fb:
         wb = csv.writer(fb)
         wb.writerow(["date", "rule", "match_id", "league", "home", "away", "minute", "line", "under", "ht_home", "ht_away", "pnl"])
@@ -531,8 +548,8 @@ def xa_daily(out_dir):
         wd = csv.writer(fd)
         wd.writerow(["date", "rule", "alerts", "settled", "pnl"])
         wd.writerows(hdaily)
-    tg(f"👀 半场小观察昨日记录 {day:%m-%d}（未验证，只观察不下；每注 1U，按推送时皇冠半场小的价、半场比分结算）\n\n"
-       + "\n\n".join(hparts) + "\n\n两条规则都已写死，约 11 月 3 日正式考一次，结果出来前规则不改。")
+    tg(f"📊 小球模型昨日记录 {day:%m-%d}（越南时间；每注 1U，按推送时 bet365 的价结算；🟢 xa / xa3 可小注，⚪ xa2 只记录；同一场几条都中，各自算一注）\n\n"
+       + "\n\n".join(parts))
     return True
 
 
