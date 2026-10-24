@@ -388,7 +388,7 @@ def branch_files():
             for n in names}
 
 
-def final_scores(days):
+def final_scores(days, ht=None):
     """{match_id: (home, away)} of finished matches on the finished-matches pages of these Beijing dates and the
     live list (state -1 = finished)."""
     out = {}
@@ -399,6 +399,9 @@ def final_scores(days):
             ft = re.findall(r">(\d+)<", tds[4]) if len(tds) >= 9 else []
             if len(tds) >= 9 and strip(tds[2]) == "完" and len(ft) == 2:
                 out[m.group(1)] = (int(ft[0]), int(ft[1]))
+                h = re.match(r"^(\d+)-(\d+)$", strip(tds[6]))
+                if h and ht is not None:
+                    ht[m.group(1)] = (int(h.group(1)), int(h.group(2)))
     for mid, (st, h, a) in live_scores().items():
         if st == -1:
             out.setdefault(mid, (h, a))
@@ -426,7 +429,16 @@ def xa_daily(out_dir):
     vsrc = [f() for n, f in sorted(files.items()) if n.endswith("_voids.csv.gz")]
     vsrc += [open(p, "rb").read() for p in sorted(glob.glob(os.path.join(out_dir, "*_voids.csv.gz")))]
     voids = {r["match_id"] for data in vsrc for r in gz_rows(data)}
-    sc = final_scores([day - timedelta(days=1), day, day + timedelta(days=1)]) if todays else {}
+    hus = {}
+    hsrc = [f() for n, f in sorted(files.items()) if n.endswith("_hu.csv.gz")]
+    hsrc += [open(p, "rb").read() for p in sorted(glob.glob(os.path.join(out_dir, "*_hu.csv.gz")))]
+    for data in hsrc:
+        for r in gz_rows(data):
+            if r.get("match_id"):
+                hus.setdefault((r.get("rule") or "LIVE_HT_UNDER", r["match_id"]), r)
+    hu_today = [(k[0], r) for k, r in hus.items() if bjt(r).date() == day]
+    ht = {}
+    sc = final_scores([day - timedelta(days=1), day, day + timedelta(days=1)], ht) if todays or hu_today else {}
     cum = {}
     for n, f in files.items():
         if n.startswith("xa_daily_") and n < f"xa_daily_{tag}":
@@ -481,6 +493,45 @@ def xa_daily(out_dir):
         wd.writerows(daily)
     tg(f"📊 小球模型昨日记录 {day:%m-%d}（越南时间；每注 1U，按推送时 bet365 的价结算；🟢 xa / xa3 可小注，⚪ xa2 只记录；同一场几条都中，各自算一注）\n\n"
        + "\n\n".join(parts))
+    # the first-half under watch pushes: settled on the half-time score at Crown's price at the push; summary only
+    # (a list would not fit one message), each bet in hu_bets_<date>.csv.gz, the totals in hu_daily_<date>.csv.gz
+    hcum = {}
+    for n, f in files.items():
+        if n.startswith("hu_daily_") and n < f"hu_daily_{tag}":
+            for r in gz_rows(f()):
+                c = hcum.setdefault(r["rule"], [0, 0.0]); c[0] += int(r["settled"]); c[1] += float(r["pnl"])
+    hparts, hdaily, hbets = [], [], []
+    for rule, cfg in HU_RULES.items():
+        mine = [r for rl, r in hu_today if rl == rule]
+        done = []
+        for r in mine:
+            k = ht.get(r["match_id"])
+            pn = _settle(_num(r["L2"]), sum(k), _num(r["u2"]), True) if k else None
+            hbets.append([tag, rule, r["match_id"], r["league"], r["home"], r["away"], r["tau2"], r["L2"], r["u2"],
+                          *(k or ("", "")), "" if pn is None else round(pn, 4)])
+            if pn is not None:
+                done.append(pn)
+        sn = sum(done)
+        c = hcum.setdefault(rule, [0, 0.0]); c[0] += len(done); c[1] += sn
+        hdaily.append([tag, rule, len(mine), len(done), round(sn, 4)])
+        win = sum(1 for x in done if x > 0.01); push = sum(1 for x in done if abs(x) <= 0.01)
+        txt = f"【{cfg['title'].replace('👀 ', '').replace('（未验证）', '')}】" + ("昨天没有推送。" if not mine else
+                                                        f"{len(mine)} 注：赢 {win} 走水 {push} 输 {len(done) - win - push}" +
+                                                        (f"，{len(mine) - len(done)} 注没找到半场比分" if len(done) < len(mine) else "") +
+                                                        f"，合计 {sn:+.2f}U" + (f"，每注 {sn / len(done):+.1%}" if done else ""))
+        if c[0]:
+            txt += f"\n上线以来 {c[0]} 注，合计 {c[1]:+.2f}U，每注 {c[1] / c[0]:+.1%}"
+        hparts.append(txt)
+    with gzip.open(os.path.join(out_dir, f"hu_bets_{tag}.csv.gz"), "wt", newline="", encoding="utf-8") as fb:
+        wb = csv.writer(fb)
+        wb.writerow(["date", "rule", "match_id", "league", "home", "away", "minute", "line", "under", "ht_home", "ht_away", "pnl"])
+        wb.writerows(hbets)
+    with gzip.open(os.path.join(out_dir, f"hu_daily_{tag}.csv.gz"), "wt", newline="", encoding="utf-8") as fd:
+        wd = csv.writer(fd)
+        wd.writerow(["date", "rule", "alerts", "settled", "pnl"])
+        wd.writerows(hdaily)
+    tg(f"👀 半场小观察昨日记录 {day:%m-%d}（未验证，只观察不下；每注 1U，按推送时皇冠半场小的价、半场比分结算）\n\n"
+       + "\n\n".join(hparts) + "\n\n两条规则都已写死，约 11 月 3 日正式考一次，结果出来前规则不改。")
     return True
 
 
