@@ -10,8 +10,9 @@ match, also written to <out>/<UTC run start>_alerts.csv.gz with the prices at th
 Beijing time the previous day's alerts (this job's and earlier jobs' on the football-data branch) are settled on the
 final scores and a daily summary is sent (xa_daily_<date>.csv.gz / xa_bets_<date>.csv.gz record it).
 
-Watch-only push (not yet tested): the frozen first-half rule LIVE_HT_UNDER (Crown's first-half O/U falling faster than
-the clock) is pushed once per match and written to <out>/<UTC run start>_hu.csv.gz; it is scored on these files later.
+Watch-only pushes (not yet tested): the frozen first-half rules LIVE_HT_UNDER and LIVE_HT_UNDER_EARLY (Crown's first-half
+O/U falling faster than the clock) are pushed once per match each, labelled apart, and written to
+<out>/<UTC run start>_hu.csv.gz; they are scored on these files later.
 
 Jobs hand over: once a later run of the workflow is waiting (or DURATION is up, when the job starts the next run
 itself) the job ends after a round, so recording continues with about a minute's gap."""
@@ -256,16 +257,22 @@ def xa_check(js, min_minute=61, gap=0.15, lmax=0.5):
     return first
 
 
-# ---------------------------------------------------------------- frozen rule LIVE_HT_UNDER (watch only, not yet tested)
-# Frozen 2026-10-21 (my-first-project scans/2026-10-21/kanpan/live/PREREG_live.md, live_patterns.py) and scored there
-# once on these recorder files after 14 recorded days. Crown's first-half O/U implies at least 10% fewer remaining
-# first-half goals (log) than time decay alone would give over a 4-7 minute window at an unchanged score, at minute
-# 10-35 of the first half -> first-half under at Crown. One per match. Same definitions as live_patterns.py.
+# ---------------------------------------------------------------- first-half under watch rules (watch only, not yet tested)
+# LIVE_HT_UNDER: frozen 2026-10-21 (my-first-project scans/2026-10-21/kanpan/live/PREREG_live.md, live_patterns.py).
+# Crown's first-half O/U implies at least 10% fewer remaining first-half goals (log) than time decay alone would give,
+# over a 4-7 minute window at an unchanged score, at minute 10-35 -> first-half under at Crown. One per match.
+# LIVE_HT_UNDER_EARLY: frozen 2026-10-24 (PREREG_live_early.md, run_live_test_early.py): the same over a 2-4 minute
+# window, at least 6% fewer, from minute 5. Both are scored once on these recorder files; same definitions as there.
 HALF_TAU = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45]
 HALF_F = [0.0, -0.11478, -0.21928, -0.3476, -0.48897, -0.66022, -0.84396, -1.09617, -1.20632, -1.31647]
-HU_TAG = "⚪ 半场小观察：规则 10-21 已写死，正在用实盘数据考试（约 11 月 3 日出结果）→ 只观察，不建议下"
+HU_RULES = {
+    "LIVE_HT_UNDER": dict(lo=4.0, hi=7.0, target=5.0, dev=-0.10, tau_lo=10.0, tau_hi=35.0, title="👀 半场小观察（未验证）",
+                          tag="⚪ 半场小观察：规则 10-21 已写死，正在用实盘数据考试（约 11 月 3 日出结果）→ 只观察，不建议下"),
+    "LIVE_HT_UNDER_EARLY": dict(lo=2.0, hi=4.0, target=3.0, dev=-0.06, tau_lo=5.0, tau_hi=35.0, title="👀 半场小观察·早版（未验证）",
+                                tag="⚪ 早版（看 3 分钟的降幅，比原版早）：10-24 写死，跟原版一起考（约 11 月 3 日出结果）→ 只观察，不建议下"),
+}
 HU_COLS = ["snap_utc", "match_id", "league", "home", "away", "home_goals", "away_goals", "tau1", "tau2", "L1", "o1", "u1",
-           "L2", "o2", "u2", "lam1", "lam2", "dev", "b365_o", "b365_L", "b365_u"]  # bet365's half O/U as quoted: over, line, under
+           "L2", "o2", "u2", "lam1", "lam2", "dev", "b365_o", "b365_L", "b365_u", "rule"]  # bet365's half O/U as quoted
 hu_hist = {}  # match -> this run's Crown snapshots in play: dict(t, tau, g, ok, o, L, u, lam, key)
 
 
@@ -286,11 +293,12 @@ def _fnum(x):
         return None
 
 
-def hu_check(mid, rows, t):
-    """This snapshot's LIVE_HT_UNDER signal for the match, or None (rows: snap() rows of one snapshot, t: its UTC time)."""
+def hu_check(mid, rows, t, sent=()):
+    """[(rule, signal)] for the watch rules that fire on this snapshot of the match and are not in sent as (rule, match)
+    (rows: snap() rows of one snapshot, t: its UTC time). Every snapshot in play is kept for the windows."""
     cr = next((r for r in rows if r[1] == "crown"), None)
     if cr is None or cr[5] not in (1, 2, 3):
-        return None
+        return []
     st, label, g = cr[5], str(cr[2]), _gn(cr[3]) + _gn(cr[4])
     m = 45.5 if label == "中场" else _fnum(label)
     tau = None if m is None else (45.5 if label == "中场" and st == 2 else None if label == "中场" or st not in (1, 3)
@@ -305,26 +313,31 @@ def hu_check(mid, rows, t):
     cur = dict(t=t, tau=tau, g=g, ok=lam is not None, o=o, L=L, u=u, lam=lam,
                key=(label, g, st, tuple(_fnum(x) for x in cr[6:18])))
     hist = hu_hist.setdefault(mid, [])
-    best = None
-    for s0 in reversed(hist):
-        dt = (t - s0["t"]).total_seconds() / 60
-        if dt > 7.0:
-            break
-        if dt < 4.0 or s0["g"] != g or not s0["ok"]:
+    out = []
+    for rule, c in HU_RULES.items():
+        if (rule, mid) in sent or not cur["ok"]:
             continue
-        if best is None or abs(dt - 5.0) < abs((t - best["t"]).total_seconds() / 60 - 5.0):
-            best = s0
+        best = None
+        for s0 in reversed(hist):
+            dt = (t - s0["t"]).total_seconds() / 60
+            if dt > c["hi"]:
+                break
+            if dt < c["lo"] or s0["g"] != g or not s0["ok"]:
+                continue
+            if best is None or abs(dt - c["target"]) < abs((t - best["t"]).total_seconds() / 60 - c["target"]):
+                best = s0
+        if best is None or best["key"] == cur["key"] or (best["tau"] == 45.0 and tau == 45.0) \
+                or tau < best["tau"] or abs(L - best["L"]) >= 0.75 - 1e-9:
+            continue
+        dev = round(math.log(lam / (best["lam"] * math.exp(_fh(tau) - _fh(best["tau"])))), 4)
+        if dev > c["dev"] or not c["tau_lo"] <= tau <= c["tau_hi"]:
+            continue
+        b = next((r for r in rows if r[1] == "b365"), None)
+        bq = tuple(_fnum(x) for x in b[6:9]) if b is not None and (_gn(b[3]), _gn(b[4])) == (_gn(cr[3]), _gn(cr[4])) else (None,) * 3
+        out.append((rule, dict(h=_gn(cr[3]), a=_gn(cr[4]), s1=best, s2=cur, dev=dev, b=bq)))
     hist.append(cur)
-    hu_hist[mid] = [s for s in hist if (t - s["t"]).total_seconds() <= 600]
-    if not cur["ok"] or best is None or best["key"] == cur["key"] or (best["tau"] == 45.0 and tau == 45.0) \
-            or tau < best["tau"] or abs(L - best["L"]) >= 0.75 - 1e-9:
-        return None
-    dev = round(math.log(lam / (best["lam"] * math.exp(_fh(tau) - _fh(best["tau"])))), 4)
-    if dev > -0.10 or not 10.0 <= tau <= 35.0:
-        return None
-    b = next((r for r in rows if r[1] == "b365"), None)
-    bq = tuple(_fnum(x) for x in b[6:9]) if b is not None and (_gn(b[3]), _gn(b[4])) == (_gn(cr[3]), _gn(cr[4])) else (None,) * 3
-    return dict(h=_gn(cr[3]), a=_gn(cr[4]), s1=best, s2=cur, dev=dev, b=bq)
+    hu_hist[mid] = [x for x in hist if (t - x["t"]).total_seconds() <= 600]
+    return out
 
 
 def tg(text):
@@ -502,7 +515,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # a cancelled job still closes its gzip files
     if os.environ.get("GITHUB_EVENT_NAME", "schedule") != "schedule":  # manual start: say it is running
         tg("⚽ 足球记录器已启动：下半场每 30 秒、其他每分钟盯皇冠和 bet365 的滚球盘。xa / xa3 / xa2（含青年、女足）有信号就推，"
-           f"每条标明能不能下；半场小观察（未验证）也推，只看不下；进球被取消会再推一条作废；每天越南时间 {DAILY_HOUR} 点推昨日总结。")
+           f"每条标明能不能下；半场小观察和早版（都未验证）也推，只看不下；进球被取消会再推一条作废；每天越南时间 {DAILY_HOUR} 点推昨日总结。")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
     path, fpath = os.path.join(OUT, f"{stamp}.csv.gz"), os.path.join(OUT, f"{stamp}_fixtures.csv.gz")
     apath = os.path.join(OUT, f"{stamp}_alerts.csv.gz")
@@ -567,19 +580,18 @@ if __name__ == "__main__":
                     live_now = any(r[5] in (1, 2, 3) for r in rows) and time.time() - sig[mid][1] < 600
                     (playing.add if live_now else playing.discard)(mid)
                     (half2.add if live_now and any(r[5] == 3 for r in rows) else half2.discard)(mid)
-                hu = hu_check(mid, rows, snap_dt) if rows and mid not in hu_sent else None
-                if hu:
-                    hu_sent.add(mid)
+                for rule, hu in (hu_check(mid, rows, snap_dt, hu_sent) if rows else []):
+                    hu_sent.add((rule, mid))
                     kt, lg, hn, an = fix.get(mid, (None, "", "", ""))
                     s1, s2, bq = hu["s1"], hu["s2"], hu["b"]
                     wh.writerow([snap_utc, mid, lg, hn, an, hu["h"], hu["a"], s1["tau"], s2["tau"], s1["L"], s1["o"], s1["u"],
-                                 s2["L"], s2["o"], s2["u"], round(s1["lam"], 4), round(s2["lam"], 4), hu["dev"], *bq]); fh.flush()
+                                 s2["L"], s2["o"], s2["u"], round(s1["lam"], 4), round(s2["lam"], 4), hu["dev"], *bq, rule]); fh.flush()
                     exp_lam = s2["lam"] / math.exp(hu["dev"])
-                    tg(f"👀 半场小观察（未验证）\n{lg} {hn} vs {an}  {hu['h']}:{hu['a']}，{s2['tau']:.0f} 分钟\n"
+                    tg(f"{HU_RULES[rule]['title']}\n{lg} {hn} vs {an}  {hu['h']}:{hu['a']}，{s2['tau']:.0f} 分钟\n"
                        f"皇冠半场大小：{s1['tau']:.0f} 分钟 {s1['L']:g} 小 {s1['u']:.2f} → 现在 {s2['L']:g} 小 {s2['u']:.2f}\n"
                        f"只算时间应该还剩 {exp_lam:.2f} 球，皇冠现在只给 {s2['lam']:.2f} 球（多降 {1 - math.exp(hu['dev']):.0%}）\n"
                        f"→ 皇冠半场小 {s2['L']:g} 水 {s2['u']:.2f}" + (f"｜bet365 现在 {bq[1]:g} 小 {bq[2]:.2f}" if None not in bq else "") +
-                       f"\n{HU_TAG}（越南时间 {datetime.now(VNT):%H:%M}）")
+                       f"\n{HU_RULES[rule]['tag']}（越南时间 {datetime.now(VNT):%H:%M}）")
                 names = "".join(fix.get(mid, (None, "", "", ""))[1:])
                 fired = []
                 youth = any(b in names for b in YOUTH)
