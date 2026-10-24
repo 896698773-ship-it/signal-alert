@@ -266,9 +266,10 @@ def xa_check(js, min_minute=61, gap=0.15, lmax=0.5):
 HALF_TAU = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45]
 HALF_F = [0.0, -0.11478, -0.21928, -0.3476, -0.48897, -0.66022, -0.84396, -1.09617, -1.20632, -1.31647]
 HU_RULES = {
-    "LIVE_HT_UNDER": dict(lo=4.0, hi=7.0, target=5.0, dev=-0.10, tau_lo=10.0, tau_hi=35.0, title="👀 半场小观察（未验证）",
+    # the user wants only the early version on the phone (2026-10-24): the original is still recorded and summarised
+    "LIVE_HT_UNDER": dict(lo=4.0, hi=7.0, target=5.0, dev=-0.10, tau_lo=10.0, tau_hi=35.0, push=False, title="👀 半场小观察（未验证）",
                           tag="⚪ 半场小观察：规则 10-21 已写死，正在用实盘数据考试（约 11 月 3 日出结果）→ 只观察，不建议下"),
-    "LIVE_HT_UNDER_EARLY": dict(lo=2.0, hi=4.0, target=3.0, dev=-0.06, tau_lo=5.0, tau_hi=35.0, title="👀 半场小观察·早版（未验证）",
+    "LIVE_HT_UNDER_EARLY": dict(lo=2.0, hi=4.0, target=3.0, dev=-0.06, tau_lo=5.0, tau_hi=35.0, push=True, title="👀 半场小观察·早版（未验证）",
                                 tag="⚪ 早版（看 3 分钟的降幅，比原版早）：10-24 写死，跟原版一起考（约 11 月 3 日出结果）→ 只观察，不建议下"),
 }
 HU_COLS = ["snap_utc", "match_id", "league", "home", "away", "home_goals", "away_goals", "tau1", "tau2", "L1", "o1", "u1",
@@ -515,7 +516,7 @@ def xa_daily(out_dir):
         c = hcum.setdefault(rule, [0, 0.0]); c[0] += len(done); c[1] += sn
         hdaily.append([tag, rule, len(mine), len(done), round(sn, 4)])
         win = sum(1 for x in done if x > 0.01); push = sum(1 for x in done if abs(x) <= 0.01)
-        txt = f"【{cfg['title'].replace('👀 ', '').replace('（未验证）', '')}】" + ("昨天没有推送。" if not mine else
+        txt = f"【{cfg['title'].replace('👀 ', '').replace('（未验证）', '')}{'' if cfg['push'] else '（不推送，只记录）'}】" + ("昨天没有推送。" if not mine else
                                                         f"{len(mine)} 注：赢 {win} 走水 {push} 输 {len(done) - win - push}" +
                                                         (f"，{len(mine) - len(done)} 注没找到半场比分" if len(done) < len(mine) else "") +
                                                         f"，合计 {sn:+.2f}U" + (f"，每注 {sn / len(done):+.1%}" if done else ""))
@@ -566,7 +567,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # a cancelled job still closes its gzip files
     if os.environ.get("GITHUB_EVENT_NAME", "schedule") != "schedule":  # manual start: say it is running
         tg("⚽ 足球记录器已启动：下半场每 30 秒、其他每分钟盯皇冠和 bet365 的滚球盘。xa / xa3 / xa2（含青年、女足）有信号就推，"
-           f"每条标明能不能下；半场小观察和早版（都未验证）也推，只看不下；进球被取消会再推一条作废；每天越南时间 {DAILY_HOUR} 点推昨日总结。")
+           f"每条标明能不能下；半场小观察早版（未验证）也推，只看不下；进球被取消会再推一条作废；每天越南时间 {DAILY_HOUR} 点推昨日总结。")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
     path, fpath = os.path.join(OUT, f"{stamp}.csv.gz"), os.path.join(OUT, f"{stamp}_fixtures.csv.gz")
     apath = os.path.join(OUT, f"{stamp}_alerts.csv.gz")
@@ -638,13 +639,14 @@ if __name__ == "__main__":
                     wh.writerow([snap_utc, mid, lg, hn, an, hu["h"], hu["a"], s1["tau"], s2["tau"], s1["L"], s1["o"], s1["u"],
                                  s2["L"], s2["o"], s2["u"], round(s1["lam"], 4), round(s2["lam"], 4), hu["dev"], *bq, rule]); fh.flush()
                     exp_lam = s2["lam"] / math.exp(hu["dev"])
-                    tg(f"{HU_RULES[rule]['title']}\n{lg} {hn} vs {an}  {hu['h']}:{hu['a']}，{s2['tau']:.0f} 分钟\n"
-                       f"皇冠半场大小：{s1['tau']:.0f} 分钟 {s1['L']:g} 小 {s1['u']:.2f} → 现在 {s2['L']:g} 小 {s2['u']:.2f}\n"
-                       f"只算时间应该还剩 {exp_lam:.2f} 球，皇冠现在只给 {s2['lam']:.2f} 球（多降 {1 - math.exp(hu['dev']):.0%}）\n"
-                       f"→ 皇冠半场小 {s2['L']:g} 水 {s2['u']:.2f}" + (f"｜bet365 现在 {bq[1]:g} 小 {bq[2]:.2f}" if None not in bq else "") +
-                       # bet365 a goal or more away from Crown at the same score: it is pricing a goal not (yet) given
-                       ("（bet365 跟皇冠差一个球以上，像是在等进球判定，先别看 bet365）" if None not in bq and abs(bq[1] - s2["L"]) >= 0.75 else "") +
-                       f"\n{HU_RULES[rule]['tag']}（越南时间 {datetime.now(VNT):%H:%M}）")
+                    if HU_RULES[rule]["push"]:
+                        tg(f"{HU_RULES[rule]['title']}\n{lg} {hn} vs {an}  {hu['h']}:{hu['a']}，{s2['tau']:.0f} 分钟\n"
+                           f"皇冠半场大小：{s1['tau']:.0f} 分钟 {s1['L']:g} 小 {s1['u']:.2f} → 现在 {s2['L']:g} 小 {s2['u']:.2f}\n"
+                           f"只算时间应该还剩 {exp_lam:.2f} 球，皇冠现在只给 {s2['lam']:.2f} 球（多降 {1 - math.exp(hu['dev']):.0%}）\n"
+                           f"→ 皇冠半场小 {s2['L']:g} 水 {s2['u']:.2f}" + (f"｜bet365 现在 {bq[1]:g} 小 {bq[2]:.2f}" if None not in bq else "") +
+                           # bet365 a goal or more away from Crown at the same score: it is pricing a goal not (yet) given
+                           ("（bet365 跟皇冠差一个球以上，像是在等进球判定，先别看 bet365）" if None not in bq and abs(bq[1] - s2["L"]) >= 0.75 else "") +
+                           f"\n{HU_RULES[rule]['tag']}（越南时间 {datetime.now(VNT):%H:%M}）")
                 names = "".join(fix.get(mid, (None, "", "", ""))[1:])
                 fired = []
                 youth = any(b in names for b in YOUTH)
