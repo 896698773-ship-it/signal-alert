@@ -265,7 +265,7 @@ HALF_TAU = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45]
 HALF_F = [0.0, -0.11478, -0.21928, -0.3476, -0.48897, -0.66022, -0.84396, -1.09617, -1.20632, -1.31647]
 HU_TAG = "⚪ 半场小观察：规则 10-21 已写死，正在用实盘数据考试（约 11 月 3 日出结果）→ 只观察，不建议下"
 HU_COLS = ["snap_utc", "match_id", "league", "home", "away", "home_goals", "away_goals", "tau1", "tau2", "L1", "o1", "u1",
-           "L2", "o2", "u2", "lam1", "lam2", "dev", "b365_L", "b365_o", "b365_u"]
+           "L2", "o2", "u2", "lam1", "lam2", "dev", "b365_o", "b365_L", "b365_u"]  # bet365's half O/U as quoted: over, line, under
 hu_hist = {}  # match -> this run's Crown snapshots in play: dict(t, tau, g, ok, o, L, u, lam, key)
 
 
