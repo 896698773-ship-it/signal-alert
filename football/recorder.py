@@ -16,7 +16,7 @@ O/U falling faster than the clock) are pushed once per match each, labelled apar
 
 Jobs hand over: once a later run of the workflow is waiting (or DURATION is up, when the job starts the next run
 itself) the job ends after a round, so recording continues with about a minute's gap."""
-import csv, glob, gzip, io, math, os, re, signal, subprocess, sys, time, json
+import csv, glob, gzip, io, math, os, re, signal, socket, subprocess, sys, threading, time, json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import requests
@@ -44,14 +44,37 @@ ALERT_COLS = ["snap_utc", "match_id", "league", "home", "away", "home_goals", "a
 FAILS = [0, 0]  # failed requests, all requests in the current round
 
 
+def _fetch(url, limit=40):
+    """GET with a limit on the total time: requests' timeout only bounds each read, so an answer that keeps trickling
+    in could hold a request (and the whole recorder) for hours, as on 2026-10-31 from 21:58 Vietnam time. At the limit
+    the socket is shut down, which ends a blocked read; the watchdog below is the backstop if that ever fails."""
+    t0 = time.time()
+    with S.get(url, timeout=(10, 20), stream=True) as r:
+        def cut():
+            try:
+                r.raw._fp.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+            except Exception:  # noqa: BLE001 - no socket to cut (already closed): nothing to do
+                pass
+        timer = threading.Timer(limit, cut)
+        timer.daemon = True
+        timer.start()
+        try:
+            body = r.content
+        except requests.RequestException as e:
+            raise requests.Timeout(f"total time limit ({type(e).__name__})") if time.time() - t0 >= limit else e
+        finally:
+            timer.cancel()
+        return r.status_code, body
+
+
 def get(path, enc=None):
     FAILS[1] += 1
     for k in range(3):
         try:
-            r = S.get(BASE + path, timeout=25)
-            if r.status_code == 200:
-                return r.content.decode(enc, "replace") if enc else r.content.decode("utf-8-sig", "replace")
-            if r.status_code == 404:
+            code, body = _fetch(BASE + path)
+            if code == 200:
+                return body.decode(enc, "replace") if enc else body.decode("utf-8-sig", "replace")
+            if code == 404:
                 return None
         except requests.RequestException:
             pass
@@ -578,9 +601,25 @@ def start_next_run():
             print("next run not requested:", e, flush=True)
 
 
+LAST_ROUND = [time.time()]  # end of the main loop's last round, for the watchdog
+WATCHDOG = 480  # seconds without a finished round -> the run is stuck: start the next run and end this one
+
+
+def watchdog():
+    while True:
+        time.sleep(30)
+        if time.time() - LAST_ROUND[0] > WATCHDOG:
+            print(f"watchdog: no round for {time.time() - LAST_ROUND[0]:.0f} s, starting the next run and ending this one", flush=True)
+            start_next_run()
+            os.kill(os.getpid(), signal.SIGTERM)  # closes the files cleanly if the main thread can still be interrupted
+            time.sleep(60)
+            os._exit(2)
+
+
 if __name__ == "__main__":
     os.makedirs(OUT, exist_ok=True)
     t0 = time.time()
+    threading.Thread(target=watchdog, daemon=True).start()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # a cancelled job still closes its gzip files
     if os.environ.get("GITHUB_EVENT_NAME", "schedule") != "schedule":  # manual start: say it is running
         tg("⚽ 足球记录器已启动：下半场每 30 秒、其他每分钟盯皇冠和 bet365 的滚球盘。xa / xa3 / xa2（含青年、女足）有信号就推，"
@@ -727,5 +766,6 @@ if __name__ == "__main__":
             if full_round and time.time() - t0 > 600 and newer_run_waiting():
                 print("handing over to the next run", flush=True)
                 break
+            LAST_ROUND[0] = time.time()
             time.sleep(max(1, min(left, GOAL_STEP - (time.time() - round_t))))
     print("done", written, flush=True)
