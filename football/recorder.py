@@ -639,6 +639,7 @@ if __name__ == "__main__":
         w.writerow(COLS); wf.writerow(FIX_COLS); wa.writerow(ALERT_COLS); wv.writerow(["snap_utc", "match_id", "alert_goals", "now_goals"])
         wh.writerow(HU_COLS)
         last_full, prev, active, slow_until, playing, sig, half2, rnd = 0.0, {}, set(), 0.0, set(), {}, set(), 0
+        handed = False
         while time.time() - t0 < DURATION:
             round_t = time.time()
             now = datetime.now(BJT)
@@ -761,11 +762,15 @@ if __name__ == "__main__":
                     daily_next = time.time() + 3600
             left = DURATION - (time.time() - t0)
             if left <= 0:
-                start_next_run()  # time is up and no run was waiting (a skipped schedule)
                 break
             if full_round and time.time() - t0 > 600 and newer_run_waiting():
                 print("handing over to the next run", flush=True)
+                handed = True
                 break
             LAST_ROUND[0] = time.time()
             time.sleep(max(1, min(left, GOAL_STEP - (time.time() - round_t))))
+    if not handed:  # time is up and no run was waiting (GitHub skipped or delayed the schedule): start the next one
+        # (until 2026-11-03 this only happened when a round ended past the time limit, so most runs that ran out of
+        # time ended without a successor and recording stopped until the next scheduled run, sometimes for hours)
+        start_next_run()
     print("done", written, flush=True)
