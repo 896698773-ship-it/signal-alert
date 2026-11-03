@@ -10,9 +10,9 @@ match, also written to <out>/<UTC run start>_alerts.csv.gz with the prices at th
 Beijing time the previous day's alerts (this job's and earlier jobs' on the football-data branch) are settled on the
 final scores and a daily summary is sent (xa_daily_<date>.csv.gz / xa_bets_<date>.csv.gz record it).
 
-Watch-only pushes (not yet tested): the frozen first-half rules LIVE_HT_UNDER and LIVE_HT_UNDER_EARLY (Crown's first-half
-O/U falling faster than the clock) are pushed once per match each, labelled apart, and written to
-<out>/<UTC run start>_hu.csv.gz; they are scored on these files later.
+First-half under watch rules, written to <out>/<UTC run start>_hu.csv.gz: LIVE_HT_UNDER and LIVE_HT_UNDER_EARLY (Crown's
+first-half O/U falling faster than the clock; both failed their test on 2026-11-03, record only) and HT_GAP (the two books
+disagree late in the first half; pushed watch only from 2026-11-04 and scored later on these files).
 
 Jobs hand over: once a later run of the workflow is waiting (or DURATION is up, when the job starts the next run
 itself) the job ends after a round, so recording continues with about a minute's gap."""
@@ -292,9 +292,15 @@ HU_RULES = {
     # the user wants only the early version on the phone (2026-10-24): the original is still recorded and summarised
     "LIVE_HT_UNDER": dict(lo=4.0, hi=7.0, target=5.0, dev=-0.10, tau_lo=10.0, tau_hi=35.0, push=False, title="👀 半场小观察（未验证）",
                           tag="⚪ 半场小观察：规则 10-21 已写死，正在用实盘数据考试（约 11 月 3 日出结果）→ 只观察，不建议下"),
-    "LIVE_HT_UNDER_EARLY": dict(lo=2.0, hi=4.0, target=3.0, dev=-0.06, tau_lo=5.0, tau_hi=35.0, push=True, title="👀 半场小观察·早版（未验证）",
+    # scored 2026-11-03 and failed, like the original: record only from 2026-11-04 (the user's choice)
+    "LIVE_HT_UNDER_EARLY": dict(lo=2.0, hi=4.0, target=3.0, dev=-0.06, tau_lo=5.0, tau_hi=35.0, push=False, title="👀 半场小观察·早版（未验证）",
                                 tag="⚪ 早版（看 3 分钟的降幅，比原版早）：10-24 写死，跟原版一起考（约 11 月 3 日出结果）→ 只观察，不建议下"),
+    # HT_GAP: frozen 2026-11-04 (my-first-project scans/2026-10-21/kanpan/live/PREREG_ht_gap.md, ht_gap.py), pushed watch
+    # only and scored once on the recorder days from 2026-11-04. Same definitions as ht_gap.py; see gap_check().
+    "HT_GAP": dict(kind="gap", push=True, title="👀 半场两家分歧（未验证）", price="推送时那家的价",
+                   tag="⚪ 半场两家分歧：10-20~11-03 回算 510 注每注 +8.9%，11-04 起用新比赛考（约两周）→ 只观察，不建议下"),
 }
+GAP_TAU, GAP_MIN, GAP_WMAX = (25.0, 35.0), 0.05, 0.70
 HU_COLS = ["snap_utc", "match_id", "league", "home", "away", "home_goals", "away_goals", "tau1", "tau2", "L1", "o1", "u1",
            "L2", "o2", "u2", "lam1", "lam2", "dev", "b365_o", "b365_L", "b365_u", "rule"]  # bet365's half O/U as quoted
 hu_hist = {}  # match -> this run's Crown snapshots in play: dict(t, tau, g, ok, o, L, u, lam, key)
@@ -339,7 +345,7 @@ def hu_check(mid, rows, t, sent=()):
     hist = hu_hist.setdefault(mid, [])
     out = []
     for rule, c in HU_RULES.items():
-        if (rule, mid) in sent or not cur["ok"]:
+        if c.get("kind") == "gap" or (rule, mid) in sent or not cur["ok"]:
             continue
         best = None
         for s0 in reversed(hist):
@@ -362,6 +368,35 @@ def hu_check(mid, rows, t, sent=()):
     hist.append(cur)
     hu_hist[mid] = [x for x in hist if (t - x["t"]).total_seconds() <= 600]
     return out
+
+
+def gap_check(rows):
+    """HT_GAP at this snapshot, or None: late first half, both books' first-half O/U at the same score with 0.5 goal of
+    line left, the books' implied remaining first-half goals differ by >= GAP_MIN, and the one that expects more goals
+    offers the under at < GAP_WMAX -> first-half under there. Same definitions as ht_gap.py / live_patterns.py."""
+    q = {}
+    for r in rows:
+        if r[1] not in ("crown", "b365") or r[5] != 1:
+            continue
+        label, g = str(r[2]), _gn(r[3]) + _gn(r[4])
+        m = _fnum(label)
+        o, L, u = (_fnum(x) for x in r[6:9])
+        if m is None or None in (o, L, u) or not (0.40 <= o <= 2.00 and 0.40 <= u <= 2.00):
+            continue
+        lam = lam_rem(o, L, u, g)
+        if lam is None or not 0.006 <= lam <= 8.9:
+            continue
+        q[r[1]] = dict(tau=min(m, 45.0), g=g, h=_gn(r[3]), a=_gn(r[4]), o=o, L=L, u=u, lam=lam)
+    c, b = q.get("crown"), q.get("b365")
+    if not c or not b or c["g"] != b["g"] or not GAP_TAU[0] <= c["tau"] <= GAP_TAU[1]:
+        return None
+    if abs(c["L"] - c["g"] - 0.5) > 1e-9 or abs(b["L"] - b["g"] - 0.5) > 1e-9:
+        return None
+    gap = b["lam"] - c["lam"]
+    gen, oth = (b, c) if gap >= GAP_MIN else (c, b) if gap <= -GAP_MIN else (None, None)
+    if gen is None or gen["u"] >= GAP_WMAX:
+        return None
+    return dict(book="bet365" if gen is b else "皇冠", other="皇冠" if gen is b else "bet365", gen=gen, oth=oth, gap=gap, c=c, b=b)
 
 
 def tg(text, limit=4000):
@@ -554,7 +589,7 @@ def xa_daily(out_dir):
         win = sum(1 for x in done if x > 0.01); push = sum(1 for x in done if abs(x) <= 0.01)
         if not cfg["push"]:
             continue
-        txt = f"【{cfg['title'].replace('👀 ', '').replace('（未验证）', '')}（未验证，只观察不下；按推送时皇冠半场小的价、半场比分结算）】" + ("昨天没有推送。" if not mine else
+        txt = f"【{cfg['title'].replace('👀 ', '').replace('（未验证）', '')}（未验证，只观察不下；按{cfg.get('price', '推送时皇冠半场小的价')}、半场比分结算）】" + ("昨天没有推送。" if not mine else
                                                         f"{len(mine)} 注：赢 {win} 走水 {push} 输 {len(done) - win - push}" +
                                                         (f"，{len(mine) - len(done)} 注没找到半场比分" if len(done) < len(mine) else "") +
                                                         f"，合计 {sn:+.2f}U" + (f"，每注 {sn / len(done):+.1%}" if done else ""))
@@ -623,7 +658,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # a cancelled job still closes its gzip files
     if os.environ.get("GITHUB_EVENT_NAME", "schedule") != "schedule":  # manual start: say it is running
         tg("⚽ 足球记录器已启动：下半场每 30 秒、其他每分钟盯皇冠和 bet365 的滚球盘。xa / xa3 / xa2（含青年、女足）有信号就推，"
-           f"每条标明能不能下；半场小观察早版（未验证）也推，只看不下；进球被取消会再推一条作废；每天越南时间 {DAILY_HOUR} 点推昨日总结。")
+           f"每条标明能不能下；半场两家分歧（未验证）也推，只看不下；进球被取消会再推一条作废；每天越南时间 {DAILY_HOUR} 点推昨日总结。")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
     path, fpath = os.path.join(OUT, f"{stamp}.csv.gz"), os.path.join(OUT, f"{stamp}_fixtures.csv.gz")
     apath = os.path.join(OUT, f"{stamp}_alerts.csv.gz")
@@ -704,6 +739,20 @@ if __name__ == "__main__":
                            # bet365 a goal or more away from Crown at the same score: it is pricing a goal not (yet) given
                            ("（bet365 跟皇冠差一个球以上，像是在等进球判定，先别看 bet365）" if None not in bq and abs(bq[1] - s2["L"]) >= 0.75 else "") +
                            f"\n{HU_RULES[rule]['tag']}（越南时间 {datetime.now(VNT):%H:%M}）")
+                gp = gap_check(rows) if rows and ("HT_GAP", mid) not in hu_sent else None
+                if gp:
+                    hu_sent.add(("HT_GAP", mid))
+                    kt, lg, hn, an = fix.get(mid, (None, "", "", ""))
+                    gen, oth, b = gp["gen"], gp["oth"], gp["b"]
+                    wh.writerow([snap_utc, mid, lg, hn, an, gen["h"], gen["a"], "", gp["c"]["tau"], oth["L"], oth["o"], oth["u"],
+                                 gen["L"], gen["o"], gen["u"], round(oth["lam"], 4), round(gen["lam"], 4), round(gp["gap"], 4),
+                                 b["o"], b["L"], b["u"], "HT_GAP"]); fh.flush()
+                    if HU_RULES["HT_GAP"]["push"]:
+                        tg(f"{HU_RULES['HT_GAP']['title']}\n{lg} {hn} vs {an}  {gen['h']}:{gen['a']}，{gp['c']['tau']:.0f} 分钟\n"
+                           f"皇冠半场 {gp['c']['L']:g} 小 {gp['c']['u']:.2f}｜bet365 半场 {b['L']:g} 小 {b['u']:.2f}\n"
+                           f"{gp['book']} 算上半场还剩 {gen['lam']:.2f} 球，{gp['other']}只算 {oth['lam']:.2f} 球（差 {abs(gp['gap']):.2f}）\n"
+                           f"→ {gp['book']} 半场小 {gen['L']:g} 水 {gen['u']:.2f}\n"
+                           f"{HU_RULES['HT_GAP']['tag']}（越南时间 {datetime.now(VNT):%H:%M}）")
                 names = "".join(fix.get(mid, (None, "", "", ""))[1:])
                 fired = []
                 youth = any(b in names for b in YOUTH)
