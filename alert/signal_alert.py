@@ -390,72 +390,20 @@ def fmt_entry(model, p, bar, eq, risk, meta, k_trail, hours, label):
 
 
 def one_pass(meta, last_done):
+    """Each 5-minute close: at an hour close, F (the C / D / E models were removed at the user's request, 2026-11-04)."""
     now_ms = int(time.time() * 1000)
-    tb, ab = closed_klines("BTCUSDT", now_ms)
+    tb, _ = closed_klines("BTCUSDT", now_ms)
     bar = tb[-1]
     if bar == last_done:
         return bar
-    btc_down, btc_up = ab[-1, 3] < ab[-1 - N, 3], ab[-1, 3] > ab[-1 - N, 3]
     eq = float(os.environ.get("EQUITY", "100"))
-    rl, rs = float(os.environ.get("RISK_LONG", "0.02")), float(os.environ.get("RISK_SHORT", "0.01"))
-    rc, rd = float(os.environ.get("RISK_C", "0.02")), float(os.environ.get("RISK_D", "0.02"))
-    capd = float(os.environ.get("CAP_D", "0.01"))
-    lines, f_rest = [], []
-    if (bar + 300_000) % HOUR == 0:  # the last 5m bar of an hour: that 1h bar has closed too, F goes out first
+    f_rest = []
+    if (bar + 300_000) % HOUR == 0:  # the last 5m bar of an hour: that 1h bar has closed too
         try:
             f_rest = f_first(meta, now_ms, bar, eq)
-        except Exception as e:  # noqa: BLE001 - F must not hold up C/D/E
+        except Exception as e:  # noqa: BLE001
             send(f"⚠️ F 检查出错：{e}")
-
-    def fetch(sym):
-        try:
-            return sym, closed_klines(sym, now_ms)
-        except Exception:  # noqa: BLE001
-            return sym, ([], None)
-
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        data = list(pool.map(fetch, list(meta)))
-    fresh = {}
-    for sym, (t, a) in data:
-        m = meta[sym]
-        if not t or t[-1] != bar:
-            continue
-        fresh[sym] = (t, a)
-        for side, models, stop, qv24, ch24 in check(sym, t, a, btc_up, btc_down, m["tick"]):
-            ref = a[-1, 3]
-            dist = abs(ref - stop) / ref
-            risk = eq * (rl if side == "long" else rs)
-            notional = risk / (dist + 2 * FEE)
-            lev = safe_lev(ref, stop, side, m.get("L", 20), m.get("mmr", 0.01))
-            note = "（建议暂停实盘，仅记录）" if side == "short" else ""
-            lines.append(
-                f"{'🟢做多' if side == 'long' else '🔴做空'} {sym} [{'+'.join(models)}]{note}\n"
-                f"📌 入场价 {ref:.6g}（限价单，挂到 {bj(bar + 600_000)} 没成交就撤，不追）\n"
-                f"🛑 止损价 {stop:.6g}（距离 {dist * 100:.2f}%，下单同时挂好）\n"
-                f"⏱ 平仓：E 在 {bj(bar + 300_000 + 4 * 3_600_000)} 手动市价平仓（不设固定止盈）\n"
-                f"{eq:.0f}U 风险 {risk:.1f}U → 仓位约 {notional:.0f}U，杠杆 ≤{lev}x，保证金约 {notional / lev:.1f}U\n"
-                f"24h 额 {qv24 / 1e6:.0f}M，24h {ch24 * 100:+.1f}%"
-                + ("\n" + e_aggr_line(sym, ref, stop, float(np.median(a[-12:, 4])), meta, last_value("E_aggr_eq", 100.0))
-                   if side == "long" else ""))
-    # D: replay the last ~17.5 h (RSI warmed up on the 100 bars before) across all fresh coins
-    dd = {s: (t, a, *rsi_atr(a)) for s, (t, a) in fresh.items() if len(t) >= 120}
-    _, d_events, d_pending = d_run(dd, meta, eq, rd, capd, tb[max(0, len(tb) - 211):], bar)
-    lines += [fmt_exit("D", p, ex, bar) for p, ex in d_events if not (ex and ex[0] == "time")]
-    if d_pending:
-        lines.append(fmt_entry("D", d_pending, bar, eq, rd, meta, 5, 4, "RSI 极值回头") + "\n"
-                     + aggr_line(d_pending, meta, last_value("D_aggr_eq", 100.0)))
-    # C: replay ETHUSDT over ~3.5 days
-    tc, ac = closed_klines("ETHUSDT", now_ms, limit=1000)
-    if tc and tc[-1] == bar:
-        _, c_events, c_pending = c_run(tc, ac, rsi_atr(ac)[1], bar)
-        lines += [fmt_exit("C", p, ex, bar) for p, ex in c_events if not (ex and ex[0] == "time")]
-        if c_pending:
-            lines.append(fmt_entry("C", c_pending, bar, eq, rc, meta, 3, 24, "跌破前 6 小时最低价"))
-    if lines:
-        # C / D / E are record only (the user's choice, 2026-10-22): logged here and counted in the daily record, not pushed
-        print(f"⏰ {bj(bar)} 收盘信号（只记录，不推送）（BTC 4h {'跌' if btc_down else '涨'}）\n\n" + "\n\n".join(lines), flush=True)
-    else:
-        print(bj(bar), "no signal")
+    print(bj(bar), "F done" if (bar + 300_000) % HOUR == 0 else "-")
     if f_rest:  # F exits of the coins checked after the first F message
         send(f"⏰ {bj(bar + 300_000)} 整点 F（其余币的平仓）\n\n" + "\n\n".join(f_rest))
     return bar
@@ -681,51 +629,9 @@ def e_closed(fdata, tb, ab, meta, d0, d1):
 
 
 def daily_summary(meta, d0):
-    """Replay the day starting at d0 (Beijing midnight, ms): every C / D / E trade that closed that day."""
+    """Replay the day starting at d0 (Beijing midnight, ms): every F trade that closed that day."""
     d1, now = d0 + DAY_MS, int(time.time() * 1000)
-    eq = float(os.environ.get("EQUITY", "100"))
-    rl, rs = float(os.environ.get("RISK_LONG", "0.02")), float(os.environ.get("RISK_SHORT", "0.01"))
-    rc, rd = float(os.environ.get("RISK_C", "0.02")), float(os.environ.get("RISK_D", "0.02"))
-    capd = float(os.environ.get("CAP_D", "0.01"))
-    need = min(1000, int((now - d0) / 300_000) + 360)
     time.sleep(60)  # let the 5-minute pass's request weight leave Binance's one-minute window first
-
-    def fetch(sym):
-        time.sleep(0.8)  # about 5 requests per second over 4 threads keeps the request weight low
-        daily_gate()
-        try:
-            return sym, closed_klines(sym, now, limit=need)
-        except Exception:  # noqa: BLE001
-            return sym, ([], None)
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        fdata = {s: (t, a) for s, (t, a) in pool.map(fetch, list(meta)) if t and len(t) >= 120}
-    tb, ab = fdata["BTCUSDT"]
-    E = e_closed(fdata, tb, ab, meta, d0, d1)
-    dd = {s: (t, a, *rsi_atr(a)) for s, (t, a) in fdata.items()}
-    dlog, clog = [], []
-    dpos, _, _ = d_run(dd, meta, eq, rd, capd, [v for v in tb if v >= d0 - 72 * 300_000], tb[-1], dlog)
-    D = [dict(model="D", sym=x["sym"], t=x["entry_t"], R=(x["sg"] * (x["px"] - x["fill"]) - FEE * (x["fill"] + x["px"])) / x["unit"])
-         for x in dlog if d0 <= x["exit_t"] < d1]
-    tc, ac = closed_klines("ETHUSDT", now, limit=1000)
-    cpos, _, _ = c_run(tc, ac, rsi_atr(ac)[1], tc[-1], clog)
-    C = [dict(model="C", sym="ETHUSDT", t=x["entry_t"],
-              R=((x["fill"] - x["px"]) / x["fill"] - 2 * FEE) / ((x["stop"] - x["fill"]) / x["fill"] + 2 * FEE))
-         for x in clog if d0 <= x["exit_t"] < d1]
-    el, es = [x for x in E if x["model"] == "E做多"], [x for x in E if x["model"] == "E做空"]
-    e0 = eq_e = last_value("E_aggr_eq", 100.0)  # E long aggressive: its own account, one position at a time
-    busy = 0
-    for x in sorted(el, key=lambda x: x["t"]):
-        q = sized(meta[x["sym"]], "long", x["fill"], x["stop"], x["med12"], eq_e, R_AGGR, CAP_AGGR) \
-            if x["t"] >= busy and eq_e >= 5 else None
-        if q:
-            eq_e += q["qty"] * (x["px"] - q["fill"]) - FEE * q["qty"] * (q["fill"] + x["px"])
-            busy = x["exit_t"]
-    a0 = eq_a = last_value("D_aggr_eq", 100.0)  # GPT's aggressive D: its own compounding account
-    for x in sorted((x for x in dlog if d0 <= x["exit_t"] < d1), key=lambda x: x["entry_t"]):
-        q = d_open(meta[x["sym"]], x["side"], x["atr_i"], x["med12"], x["px_open"], eq_a, R_AGGR, CAP_AGGR) if eq_a >= 5 else None
-        if q:
-            eq_a += q["qty"] * (x["sg"] * (x["px"] - q["fill"]) - FEE * (q["fill"] + x["px"]))
     hlimit = min(499, int((now - d0) / HOUR) + 70)  # 24 h of trade + 24 h change + ATR before the day
 
     def fetch_h(sym):
@@ -749,10 +655,6 @@ def daily_summary(meta, d0):
     f0 = eq_f = last_value("F_eq", 100.0)  # F: its own 100U account, 1% risk per trade, compounding
     for x in sorted(F, key=lambda x: x["exit_t"]):
         eq_f *= 1 + F_RISK * x["R"]
-    DW = [x for x in D if f_in_win(x["t"])]  # D entered on a weekday 08:00-11:59 BJT (record only)
-    dw0 = eq_dw = last_value("DW_eq", 100.0)
-    for x in sorted(DW, key=lambda x: x["t"]):
-        eq_dw = max(0.0, eq_dw * (1 + D_WIN_RISK * x["R"]))
     W0 = [x for x in F0 if x["win"] and x["wd"]]  # the pushed F: weekday 08-12 entries, no adds
     WE = [x for x in F0 if x["win"] and not x["wd"]]  # weekend 08-12, for comparison only
     WK = [x for x in F0 if not x["wd"] and 14 <= datetime.fromtimestamp(x["t"] / 1000, BJT).hour < 18]  # weekend 14-18, record only
@@ -777,25 +679,9 @@ def daily_summary(meta, d0):
                          + [f"  {bj(x['t']) if x['t'] < d0 else bj(x['t'])[6:]} {x['sym']} {x['R']:+.2f}R"
                             for x in sorted(L, key=lambda x: x["t"])])
 
-    u = sum(x["R"] for x in el) * eq * rl + sum(x["R"] for x in C) * eq * rc + sum(x["R"] for x in D) * eq * rd
-    prev = 0.0
-    p = os.path.join(REC, "daily.csv")
-    if os.path.exists(p):
-        rows = [x.split(",") for x in open(p).read().splitlines()[1:] if x]
-        prev = float(rows[-1][8]) if rows and rows[-1][0] != RESET_AFTER else 0.0
     day = bj(d0)[:5]
-    opened = [f"{m} {x['sym']}（{bj(x['entry_t'])} 入场）" for m, x in (("D", dpos), ("C", cpos)) if x]
-    text = (f"📊 昨日战绩 {day}（当天平仓的单，按推送的仓位：{eq:.0f}U，每笔风险 {eq * rl:.0f}U）\n\n"
-            + "\n".join([block("E做多", el, eq * rl), block("C做空ETH", C, eq * rc), block("D", D, eq * rd)])
-            + f"\n  D 其中工作日 08-12 点（只记录）：{len(DW)} 笔 {sum(x['R'] for x in DW):+.2f}R，"
-            + f"独立 100U 账户每笔 {D_WIN_RISK * 100:.0f}%：{dw0:.1f}U → {eq_dw:.1f}U"
-            + f"\n\n合计 {u:+.1f}U；累计 {prev + u:+.1f}U（{eq:.0f}U → {eq + prev + u:.1f}U）\n"
-            + f"{block('E做空（只记录）', es, eq * rs).splitlines()[0]}\n"
-            + f"🔥 D 的 GPT 激进版（目标每笔止损亏 {R_AGGR * 100:.0f}%，独立 100U 账户，和 30% 方案分开）："
-            + f"当天 {eq_a - a0:+.1f}U，{a0:.1f}U → {eq_a:.1f}U\n"
-            + f"🔥 E 做多激进版（目标每笔止损亏 {R_AGGR * 100:.0f}%，一次一笔，独立 100U 账户）：当天 {eq_e - e0:+.1f}U，{e0:.1f}U → {eq_e:.1f}U"
-            + (f"\n持仓中：{'；'.join(opened)}" if opened else "")
-            + f"\n\n🟣 F 工作日 08-12 点（推送版，不加仓，每笔风险 {F_WIN_RISK * 100:.0f}%，独立 100U 账户）：{w0:.1f}U → {eq_w:.1f}U\n"
+    text = (f"📊 昨日战绩 {day}（当天平仓的单）\n\n"
+            + f"🟣 F 工作日 08-12 点（推送版，不加仓，每笔风险 {F_WIN_RISK * 100:.0f}%，独立 100U 账户）：{w0:.1f}U → {eq_w:.1f}U\n"
             + block("F", W0, w0 * F_WIN_RISK)
             + f"\n止盈版对照（同样这些单，2R 平一半后保本、4R 平剩下，每笔 {F_WIN_RISK * 100:.0f}%）：{len(TP)} 笔 "
             + f"{sum(x['Rtp'] for x in TP):+.2f}R，{tp0:.1f}U → {eq_tp:.1f}U"
@@ -808,13 +694,12 @@ def daily_summary(meta, d0):
             + f"\nF 分时段（不加仓，只看 R）：主力 {len(W0)} 笔 {sum(x['R'] for x in W0):+.2f}R；美洲盘 21-05 点 {len(US)} 笔 "
             + f"{sum(x['R'] for x in US):+.2f}R；周末 14-18 点 {len(WK)} 笔 {sum(x['R'] for x in WK):+.2f}R；周末 08-12 点 {len(WE)} 笔 "
             + f"{sum(x['R'] for x in WE):+.2f}R；其他时段 {len(OT)} 笔 {sum(x['R'] for x in OT):+.2f}R")
-    row = ",".join([day, str(len(el)), f"{sum(x['R'] for x in el):.3f}", str(len(C)), f"{sum(x['R'] for x in C):.3f}",
-                    str(len(D)), f"{sum(x['R'] for x in D):.3f}", f"{u:.2f}", f"{prev + u:.2f}", str(len(es)),
-                    f"{sum(x['R'] for x in es):.3f}", f"{eq_a:.2f}", f"{eq_e:.2f}", str(len(F)),
+    # same columns as before; the C / D / E ones (removed 2026-11-04) are left empty
+    row = ",".join([day, "", "", "", "", "", "", "", "", "", "", "", "", str(len(F)),
                     f"{sum(x['R'] for x in F):.3f}", f"{eq_f:.2f}", str(len(W0)), f"{sum(x['R'] for x in W0):.3f}",
-                    f"{eq_w:.2f}", f"{sum(x['R'] for x in WE):.3f}", str(len(DW)), f"{sum(x['R'] for x in DW):.3f}",
-                    f"{eq_dw:.2f}", str(len(WK)), f"{sum(x['R'] for x in WK):.3f}", f"{eq_k:.2f}", f"{sum(x['Rtp'] for x in TP):.3f}", f"{eq_tp:.2f}", str(len(F0)), f"{sum(x['R'] for x in F0):.3f}", str(len(US)), f"{sum(x['R'] for x in US):.3f}",
-                    str(len(OT)), f"{sum(x['R'] for x in OT):.3f}"])
+                    f"{eq_w:.2f}", f"{sum(x['R'] for x in WE):.3f}", "", "", "", str(len(WK)), f"{sum(x['R'] for x in WK):.3f}",
+                    f"{eq_k:.2f}", f"{sum(x['Rtp'] for x in TP):.3f}", f"{eq_tp:.2f}", str(len(F0)), f"{sum(x['R'] for x in F0):.3f}",
+                    str(len(US)), f"{sum(x['R'] for x in US):.3f}", str(len(OT)), f"{sum(x['R'] for x in OT):.3f}"])
     return day, text, row
 
 
@@ -848,11 +733,6 @@ def period_summary(n=None, label="上线以来"):
     out.append(f"   F 周末 14-18 点：{cnt('FWE_n')} 笔 {tot('FWE_R'):+.2f}R{since('FWE_R')}；周末 08-12 点：{tot('FW_weekend_R'):+.2f}R")
     out.append(f"   F 美洲盘 21-05 点：{cnt('FUS_n')} 笔 {tot('FUS_R'):+.2f}R{since('FUS_R')}；其他时段：{cnt('FOT_n')} 笔 "
                f"{tot('FOT_R'):+.2f}R{since('FOT_R')}")
-    out.append(f"E 做多：{cnt('E_long_n')} 笔 {tot('E_long_R'):+.2f}R")
-    out.append(f"E 做空（只记录）：{cnt('E_short_n')} 笔 {tot('E_short_R'):+.2f}R")
-    out.append(f"C 做空 ETH：{cnt('C_n')} 笔 {tot('C_R'):+.2f}R")
-    out.append(f"D：{cnt('D_n')} 笔 {tot('D_R'):+.2f}R（其中工作日 08-12 点 {cnt('DW_n')} 笔 {tot('DW_R'):+.2f}R{since('DW_R')}）")
-    out.append(f"C+D+E 按推送仓位（每笔 6U）：{tot('day_U'):+.1f}U")
     fd = [r for r in sel if r.get("FW_R")]
     if fd:
         best = max(fd, key=lambda r: v(r, "FW_R")); worst = min(fd, key=lambda r: v(r, "FW_R"))
@@ -941,7 +821,7 @@ def main():
     # jobs hand over every few hours: say so once a day (the 08-09 start) and on manual starts
     if os.environ.get("HEARTBEAT", "1") == "1" and (os.environ.get("GITHUB_EVENT_NAME") != "schedule"
                                                    or datetime.now(BJT).hour in (8, 9)):
-        send(f"✅ 信号监控运行中：整点推送 F；C/D/E 只记录不推送，战绩照常在每日记录里（{len(meta)} 个币）")
+        send(f"✅ 信号监控运行中：整点推送 F，每日战绩照常（{len(meta)} 个币）")
     last, errors, daily, worker, leaving = None, 0, {}, None, False
     while True:
         PASS.set()
