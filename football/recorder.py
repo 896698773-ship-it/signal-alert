@@ -292,9 +292,9 @@ HU_RULES = {
     # the user wants only the early version on the phone (2026-10-24): the original is still recorded and summarised
     "LIVE_HT_UNDER": dict(lo=4.0, hi=7.0, target=5.0, dev=-0.10, tau_lo=10.0, tau_hi=35.0, push=False, title="👀 半场小观察（未验证）",
                           tag="⚪ 半场小观察：规则 10-21 已写死，正在用实盘数据考试（约 11 月 3 日出结果）→ 只观察，不建议下"),
-    # scored 2026-11-03 and failed, like the original: record only from 2026-11-04 (the user's choice)
-    "LIVE_HT_UNDER_EARLY": dict(lo=2.0, hi=4.0, target=3.0, dev=-0.06, tau_lo=5.0, tau_hi=35.0, push=False, title="👀 半场小观察·早版（未验证）",
-                                tag="⚪ 早版（看 3 分钟的降幅，比原版早）：10-24 写死，跟原版一起考（约 11 月 3 日出结果）→ 只观察，不建议下"),
+    # scored 2026-11-03 and failed; record only 2026-11-04, pushed again (watch only) from 2026-11-05 at the user's request
+    "LIVE_HT_UNDER_EARLY": dict(lo=2.0, hi=4.0, target=3.0, dev=-0.06, tau_lo=5.0, tau_hi=35.0, push=True, title="👀 半场小观察·早版（已考未通过）",
+                                tag="⚪ 早版：11-03 已考，没通过（考试期 1,030 注每注 -1.1%）→ 只观察，不建议下"),
     # HT_GAP: frozen 2026-11-04 (my-first-project scans/2026-10-21/kanpan/live/PREREG_ht_gap.md, ht_gap.py), pushed watch
     # only and scored once on the recorder days from 2026-11-04. Same definitions as ht_gap.py; see gap_check().
     "HT_GAP": dict(kind="gap", push=True, title="👀 半场两家分歧（未验证）", price="推送时那家的价",
@@ -658,7 +658,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # a cancelled job still closes its gzip files
     if os.environ.get("GITHUB_EVENT_NAME", "schedule") != "schedule":  # manual start: say it is running
         tg("⚽ 足球记录器已启动：下半场每 30 秒、其他每分钟盯皇冠和 bet365 的滚球盘。xa / xa3 / xa2（含青年、女足）有信号就推，"
-           f"每条标明能不能下；半场两家分歧（未验证）也推，只看不下；进球被取消会再推一条作废；每天越南时间 {DAILY_HOUR} 点推昨日总结。")
+           f"每条标明能不能下；半场两家分歧（未验证）和半场小早版（已考未通过）也推，只看不下；进球被取消会再推一条作废；每天越南时间 {DAILY_HOUR} 点推昨日总结。")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
     path, fpath = os.path.join(OUT, f"{stamp}.csv.gz"), os.path.join(OUT, f"{stamp}_fixtures.csv.gz")
     apath = os.path.join(OUT, f"{stamp}_alerts.csv.gz")
