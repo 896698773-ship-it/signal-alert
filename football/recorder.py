@@ -118,6 +118,9 @@ def fixtures(now):
     return out
 
 
+LIVE_NAMES = {}  # match -> (league, home, away) from the live list, for matches missing from the schedule pages
+
+
 def live_scores():
     """{match_id: (state, home goals, away goals)} for every match in the live list (state 1/2/3 = in play)."""
     t = get("/vbsxml/bfdata.js", "gb18030")
@@ -129,7 +132,13 @@ def live_scores():
         except (IndexError, ValueError):
             continue
         out[mid] = (st, h, a)
+        LIVE_NAMES[mid] = (f[1], f[4], f[7])
     return out
+
+
+def names_of(fix, mid):
+    """(kickoff, league, home, away): from the schedule pages, else the live list's names (no kickoff)."""
+    return fix.get(mid) or (None, *LIVE_NAMES.get(mid, ("", "", "")))
 
 
 def parse_js(t):
@@ -293,10 +302,13 @@ HU_RULES = {
     "LIVE_HT_UNDER": dict(lo=4.0, hi=7.0, target=5.0, dev=-0.10, tau_lo=10.0, tau_hi=35.0, push=False, title="👀 半场小观察（未验证）",
                           tag="⚪ 半场小观察：规则 10-21 已写死，正在用实盘数据考试（约 11 月 3 日出结果）→ 只观察，不建议下"),
     # scored 2026-11-03 and failed; record only 2026-11-04, pushed again (watch only) from 2026-11-05 at the user's request
-    "LIVE_HT_UNDER_EARLY": dict(lo=2.0, hi=4.0, target=3.0, dev=-0.06, tau_lo=5.0, tau_hi=35.0, push=True, title="👀 半场小观察·早版（已考未通过）",
+    "LIVE_HT_UNDER_EARLY": dict(lo=2.0, hi=4.0, target=3.0, dev=-0.06, tau_lo=5.0, tau_hi=35.0, push=True, title="👀 半场小观察·早版（已考未通过）", status="已考未通过，只观察不下",
                                 tag="⚪ 早版：11-03 已考，没通过（考试期 1,030 注每注 -1.1%）→ 只观察，不建议下"),
     # HT_GAP: frozen 2026-11-04 (my-first-project scans/2026-10-21/kanpan/live/PREREG_ht_gap.md, ht_gap.py), pushed watch
     # only and scored once on the recorder days from 2026-11-04. Same definitions as ht_gap.py; see gap_check().
+    # FT_GAP: frozen 2026-11-05 (PREREG_ft_gap.md, ft_gap.py), pushed watch only; same definitions, see ft_gap_check()
+    "FT_GAP": dict(kind="ftgap", market="full", push=True, title="👀 全场两家分歧（未验证）", price="推送时 bet365 的价",
+                   tag="⚪ 全场两家分歧：10-20~11-03 回算 842 注每注 +5.6%，11-05 起用新比赛考（约两周）→ 只观察，不建议下"),
     "HT_GAP": dict(kind="gap", push=True, title="👀 半场两家分歧（未验证）", price="推送时那家的价",
                    tag="⚪ 半场两家分歧：10-20~11-03 回算 510 注每注 +8.9%，11-04 起用新比赛考（约两周）→ 只观察，不建议下"),
 }
@@ -345,7 +357,7 @@ def hu_check(mid, rows, t, sent=()):
     hist = hu_hist.setdefault(mid, [])
     out = []
     for rule, c in HU_RULES.items():
-        if c.get("kind") == "gap" or (rule, mid) in sent or not cur["ok"]:
+        if c.get("kind") in ("gap", "ftgap") or (rule, mid) in sent or not cur["ok"]:
             continue
         best = None
         for s0 in reversed(hist):
@@ -397,6 +409,33 @@ def gap_check(rows):
     if gen is None or gen["u"] >= GAP_WMAX:
         return None
     return dict(book="bet365" if gen is b else "皇冠", other="皇冠" if gen is b else "bet365", gen=gen, oth=oth, gap=gap, c=c, b=b)
+
+
+FT_TAU, FT_MIN, FT_REM = (10.0, 60.0), 0.10, (1.25, 1.75)
+
+
+def ft_gap_check(rows):
+    """FT_GAP at this snapshot, or None: both books' full-time O/U at the same score and half, Crown clock 10-60 min,
+    bet365's implied remaining goals >= Crown's + 0.10 and 1.25-1.75 goals of line left at bet365 -> full-time under at
+    bet365. Same definitions as ft_gap.py / live_patterns.py."""
+    q = {}
+    for r in rows:
+        if r[1] not in ("crown", "b365") or r[5] not in (1, 3):
+            continue
+        m, g = _fnum(str(r[2])), _gn(r[3]) + _gn(r[4])
+        o, L, u = (_fnum(x) for x in r[9:12])
+        if m is None or None in (o, L, u) or not (0.40 <= o <= 2.00 and 0.40 <= u <= 2.00):
+            continue
+        lam = lam_rem(o, L, u, g)
+        if lam is None or not 0.006 <= lam <= 8.9:
+            continue
+        q[r[1]] = dict(st=r[5], tau=min(m, 45.0) if r[5] == 1 else max(m, 46.0), g=g, h=_gn(r[3]), a=_gn(r[4]), o=o, L=L, u=u, lam=lam)
+    c, b = q.get("crown"), q.get("b365")
+    if not c or not b or c["g"] != b["g"] or c["st"] != b["st"] or not FT_TAU[0] <= c["tau"] < FT_TAU[1]:
+        return None
+    if not FT_REM[0] - 1e-9 <= b["L"] - b["g"] <= FT_REM[1] + 1e-9 or b["lam"] - c["lam"] < FT_MIN:
+        return None
+    return dict(c=c, b=b, gap=b["lam"] - c["lam"])
 
 
 def tg(text, limit=4000):
@@ -573,25 +612,28 @@ def xa_daily(out_dir):
     for rule, cfg in HU_RULES.items():
         mine = [r for rl, r in hu_today if rl == rule]
         done, lines = [], []
+        full = cfg.get("market") == "full"
+        mk, endw = ("全场", "完场") if full else ("半场", "半场")
         for r in sorted(mine, key=bjt):
-            k = ht.get(r["match_id"])
+            k = (sc if full else ht).get(r["match_id"])
             pn = _settle(_num(r["L2"]), sum(k), _num(r["u2"]), True) if k else None
             hbets.append([tag, rule, r["match_id"], r["league"], r["home"], r["away"], r["tau2"], r["L2"], r["u2"],
                           *(k or ("", "")), "" if pn is None else round(pn, 4)])
             if pn is not None:
                 done.append(pn)
-            res = "未找到半场比分" if k is None else f"半场 {k[0]}:{k[1]} " + ("赢" if pn > 0.01 else "走水" if abs(pn) <= 0.01 else "输") + f" {pn:+.2f}"
+            res = f"未找到{endw}比分" if k is None else f"{endw} {k[0]}:{k[1]} " + ("赢" if pn > 0.01 else "走水" if abs(pn) <= 0.01 else "输") + f" {pn:+.2f}"
             lines.append(f"· {bjt(r):%H:%M} {r['league']} {r['home']} vs {r['away']} {r['home_goals']}:{r['away_goals']}，"
-                         f"{float(r['tau2']):.0f} 分钟 半场小 {_num(r['L2']):g}@{_num(r['u2']):.2f} → {res}")
+                         f"{float(r['tau2']):.0f} 分钟 {mk}小 {_num(r['L2']):g}@{_num(r['u2']):.2f} → {res}")
         sn = sum(done)
         c = hcum.setdefault(rule, [0, 0.0]); c[0] += len(done); c[1] += sn
         hdaily.append([tag, rule, len(mine), len(done), round(sn, 4)])
         win = sum(1 for x in done if x > 0.01); push = sum(1 for x in done if abs(x) <= 0.01)
         if not cfg["push"]:
             continue
-        txt = f"【{cfg['title'].replace('👀 ', '').replace('（未验证）', '')}（未验证，只观察不下；按{cfg.get('price', '推送时皇冠半场小的价')}、半场比分结算）】" + ("昨天没有推送。" if not mine else
+        name = re.sub(r"（.*?）", "", cfg["title"].replace("👀 ", ""))
+        txt = f"【{name}（{cfg.get('status', '未验证，只观察不下')}；按{cfg.get('price', '推送时皇冠半场小的价')}、{endw}比分结算）】" + ("昨天没有推送。" if not mine else
                                                         f"{len(mine)} 注：赢 {win} 走水 {push} 输 {len(done) - win - push}" +
-                                                        (f"，{len(mine) - len(done)} 注没找到半场比分" if len(done) < len(mine) else "") +
+                                                        (f"，{len(mine) - len(done)} 注没找到{endw}比分" if len(done) < len(mine) else "") +
                                                         f"，合计 {sn:+.2f}U" + (f"，每注 {sn / len(done):+.1%}" if done else ""))
         if lines:
             txt += "\n" + "\n".join(lines)
@@ -658,7 +700,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # a cancelled job still closes its gzip files
     if os.environ.get("GITHUB_EVENT_NAME", "schedule") != "schedule":  # manual start: say it is running
         tg("⚽ 足球记录器已启动：下半场每 30 秒、其他每分钟盯皇冠和 bet365 的滚球盘。xa / xa3 / xa2（含青年、女足）有信号就推，"
-           f"每条标明能不能下；半场两家分歧（未验证）和半场小早版（已考未通过）也推，只看不下；进球被取消会再推一条作废；每天越南时间 {DAILY_HOUR} 点推昨日总结。")
+           f"每条标明能不能下；半场两家分歧、全场两家分歧（都未验证）和半场小早版（已考未通过）也推，只看不下；进球被取消会再推一条作废；每天越南时间 {DAILY_HOUR} 点推昨日总结。")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
     path, fpath = os.path.join(OUT, f"{stamp}.csv.gz"), os.path.join(OUT, f"{stamp}_fixtures.csv.gz")
     apath = os.path.join(OUT, f"{stamp}_alerts.csv.gz")
@@ -711,7 +753,7 @@ if __name__ == "__main__":
                     now_g = [_gn(r[3]) + _gn(r[4]) for r in rows if r[3] not in (None, "")]
                     if now_g and max(now_g) < alert_goals[mid]:
                         wv.writerow([snap_utc, mid, alert_goals[mid], max(now_g)]); fv.flush()
-                        kt, lg, hn, an = fix.get(mid, (None, "", "", ""))
+                        kt, lg, hn, an = names_of(fix, mid)
                         tg(f"⚠️ 进球被取消：{lg} {hn} vs {an} 比分退回 {rows[0][3]}:{rows[0][4]}。之前那条小球信号作废，"
                            f"没下就别下了；下了的话 bet365 一般会把这段时间的注单作废退款，以平台规则为准（越南时间 {datetime.now(VNT):%H:%M}）")
                         del alert_goals[mid]
@@ -726,7 +768,7 @@ if __name__ == "__main__":
                     (half2.add if live_now and any(r[5] == 3 for r in rows) else half2.discard)(mid)
                 for rule, hu in (hu_check(mid, rows, snap_dt, hu_sent) if rows else []):
                     hu_sent.add((rule, mid))
-                    kt, lg, hn, an = fix.get(mid, (None, "", "", ""))
+                    kt, lg, hn, an = names_of(fix, mid)
                     s1, s2, bq = hu["s1"], hu["s2"], hu["b"]
                     wh.writerow([snap_utc, mid, lg, hn, an, hu["h"], hu["a"], s1["tau"], s2["tau"], s1["L"], s1["o"], s1["u"],
                                  s2["L"], s2["o"], s2["u"], round(s1["lam"], 4), round(s2["lam"], 4), hu["dev"], *bq, rule]); fh.flush()
@@ -742,7 +784,7 @@ if __name__ == "__main__":
                 gp = gap_check(rows) if rows and ("HT_GAP", mid) not in hu_sent else None
                 if gp:
                     hu_sent.add(("HT_GAP", mid))
-                    kt, lg, hn, an = fix.get(mid, (None, "", "", ""))
+                    kt, lg, hn, an = names_of(fix, mid)
                     gen, oth, b = gp["gen"], gp["oth"], gp["b"]
                     wh.writerow([snap_utc, mid, lg, hn, an, gen["h"], gen["a"], "", gp["c"]["tau"], oth["L"], oth["o"], oth["u"],
                                  gen["L"], gen["o"], gen["u"], round(oth["lam"], 4), round(gen["lam"], 4), round(gp["gap"], 4),
@@ -753,7 +795,20 @@ if __name__ == "__main__":
                            f"{gp['book']} 算上半场还剩 {gen['lam']:.2f} 球，{gp['other']}只算 {oth['lam']:.2f} 球（差 {abs(gp['gap']):.2f}）\n"
                            f"→ {gp['book']} 半场小 {gen['L']:g} 水 {gen['u']:.2f}\n"
                            f"{HU_RULES['HT_GAP']['tag']}（越南时间 {datetime.now(VNT):%H:%M}）")
-                names = "".join(fix.get(mid, (None, "", "", ""))[1:])
+                fg = ft_gap_check(rows) if rows and ("FT_GAP", mid) not in hu_sent else None
+                if fg:
+                    hu_sent.add(("FT_GAP", mid))
+                    kt, lg, hn, an = names_of(fix, mid)
+                    c, b = fg["c"], fg["b"]
+                    wh.writerow([snap_utc, mid, lg, hn, an, b["h"], b["a"], "", c["tau"], c["L"], c["o"], c["u"], b["L"], b["o"], b["u"],
+                                 round(c["lam"], 4), round(b["lam"], 4), round(fg["gap"], 4), b["o"], b["L"], b["u"], "FT_GAP"]); fh.flush()
+                    if HU_RULES["FT_GAP"]["push"]:
+                        tg(f"{HU_RULES['FT_GAP']['title']}\n{lg} {hn} vs {an}  {b['h']}:{b['a']}，{c['tau']:.0f} 分钟\n"
+                           f"皇冠全场 {c['L']:g} 小 {c['u']:.2f}｜bet365 全场 {b['L']:g} 小 {b['u']:.2f}\n"
+                           f"bet365 算还剩 {b['lam']:.2f} 球，皇冠只算 {c['lam']:.2f} 球（差 {fg['gap']:.2f}）\n"
+                           f"→ bet365 全场小 {b['L']:g} 水 {b['u']:.2f}\n"
+                           f"{HU_RULES['FT_GAP']['tag']}（越南时间 {datetime.now(VNT):%H:%M}）")
+                names = "".join(names_of(fix, mid)[1:])
                 fired = []
                 youth = any(b in names for b in YOUTH)
                 other_bad = any(b in names for b in BAD) and not youth
@@ -765,7 +820,7 @@ if __name__ == "__main__":
                         continue
                     alerted.add((rule, mid))
                     alert_goals[mid] = x["h"] + x["a"]
-                    kt, lg, hn, an = fix.get(mid, (None, "", "", ""))
+                    kt, lg, hn, an = names_of(fix, mid)
                     wa.writerow([snap_utc, mid, lg, hn, an, x["h"], x["a"], x["gm"], *x["c"], *x["b"], round(x["lc"], 3),
                                  round(x["lb"], 3), *x["c_now"], *x["b_now"], rule]); fa.flush()
                     if cfg["push"]:
