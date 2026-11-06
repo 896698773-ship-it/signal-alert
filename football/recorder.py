@@ -309,12 +309,38 @@ HU_RULES = {
     # FT_GAP: frozen 2026-11-05 (PREREG_ft_gap.md, ft_gap.py), pushed watch only; same definitions, see ft_gap_check()
     "FT_GAP": dict(kind="ftgap", market="full", push=True, title="👀 全场两家分歧（未验证）", price="推送时 bet365 的价",
                    tag="⚪ 全场两家分歧：10-20~11-03 回算 842 注每注 +5.6%，11-05 起用新比赛考（约两周）→ 只观察，不建议下"),
+    # FT_GAP_LITE: frozen 2026-11-05 (PREREG_ft_gap_lite.md, ft_gap_lite.py): the FT_GAP bets on Fri-Sun football days
+    # in leagues that are not lower tier, cup, youth, women or reserve (ft_lite()). Not a push of its own: the FT_GAP
+    # push carries a ⭐ line, and the daily record lists its totals (bets marked ⭐ under FT_GAP)
+    "FT_GAP_LITE": dict(kind="ftgap", market="full", push=True, sub="FT_GAP", title="⭐ 全场两家分歧·精简版（未验证）", price="推送时 bet365 的价",
+                        tag="⭐ 精简版（周五六日 + 不含低级别/杯赛/青年女足）：10-20~11-03 回算 394 注每注 +11.6%，11-06 起用新比赛考（11-15 后出结果）→ 也只观察，不建议下"),
     "HT_GAP": dict(kind="gap", push=True, title="👀 半场两家分歧（未验证）", price="推送时那家的价",
                    tag="⚪ 半场两家分歧：10-20~11-03 回算 510 注每注 +8.9%，11-04 起用新比赛考（约两周）→ 只观察，不建议下"),
 }
 GAP_TAU, GAP_MIN, GAP_WMAX = (25.0, 35.0), 0.05, 0.70
 HU_COLS = ["snap_utc", "match_id", "league", "home", "away", "home_goals", "away_goals", "tau1", "tau2", "L1", "o1", "u1",
-           "L2", "o2", "u2", "lam1", "lam2", "dev", "b365_o", "b365_L", "b365_u", "rule"]  # bet365's half O/U as quoted
+           "L2", "o2", "u2", "lam1", "lam2", "dev", "b365_o", "b365_L", "b365_u", "rule",  # bet365's half O/U as quoted
+           "lite"]  # FT_GAP rows only: 1 = also an FT_GAP_LITE bet
+LITE_MAJOR = {"英超", "西甲", "意甲", "德甲", "法甲", "欧冠", "欧罗巴杯", "欧协联", "欧国联", "世欧预", "荷甲", "葡超", "英冠", "美职业",
+              "巴西甲", "阿甲", "日职联", "韩K联", "沙特联", "土超", "比甲", "苏超", "澳超", "墨西联", "中超"}
+LITE_YOUTH = ["U1", "U2", "女", "后备", "预备", "青"]
+LITE_DROP = ["乙", "丙", "丁", "戊", "冠", "业余", "地区", "杯", "锦标"] + LITE_YOUTH
+
+
+def ft_lite(kt, league, snap_utc):
+    """FT_GAP_LITE filter (same as ft_gap_lite.py): the football day (Beijing kickoff - 12 h; without a kickoff, the
+    snapshot's Beijing time - 12 h) is Fri-Sun, and the league is not lower tier, cup, youth, women or reserve."""
+    name = league or ""
+    if any(k in name for k in LITE_YOUTH) or not (name in LITE_MAJOR or not any(k in name for k in LITE_DROP)):
+        return False
+    t = kt.astimezone(BJT).replace(tzinfo=None) if kt else datetime.strptime(snap_utc, "%Y-%m-%d %H:%M:%S") + timedelta(hours=8)
+    return (t - timedelta(hours=12)).weekday() >= 4
+
+
+def hu_lite(r):
+    """Whether a recorded FT_GAP row is also an FT_GAP_LITE bet (rows written before the flag existed: worked out again)."""
+    v = r.get("lite")
+    return v == "1" if v in ("0", "1") else ft_lite(None, r.get("league"), r["snap_utc"])
 hu_hist = {}  # match -> this run's Crown snapshots in play: dict(t, tau, g, ok, o, L, u, lam, key)
 
 
@@ -610,7 +636,8 @@ def xa_daily(out_dir):
                 c = hcum.setdefault(r["rule"], [0, 0.0]); c[0] += int(r["settled"]); c[1] += float(r["pnl"])
     hdaily, hbets = [], []
     for rule, cfg in HU_RULES.items():
-        mine = [r for rl, r in hu_today if rl == rule]
+        sub = cfg.get("sub")  # FT_GAP_LITE: the FT_GAP rows that pass its filter; totals only, the bets carry ⭐ under FT_GAP
+        mine = [r for rl, r in hu_today if rl == (sub or rule) and (not sub or hu_lite(r))]
         done, lines = [], []
         full = cfg.get("market") == "full"
         mk, endw = ("全场", "完场") if full else ("半场", "半场")
@@ -622,8 +649,11 @@ def xa_daily(out_dir):
             if pn is not None:
                 done.append(pn)
             res = f"未找到{endw}比分" if k is None else f"{endw} {k[0]}:{k[1]} " + ("赢" if pn > 0.01 else "走水" if abs(pn) <= 0.01 else "输") + f" {pn:+.2f}"
-            lines.append(f"· {bjt(r):%H:%M} {r['league']} {r['home']} vs {r['away']} {r['home_goals']}:{r['away_goals']}，"
+            star = "⭐" if rule == "FT_GAP" and hu_lite(r) else ""
+            lines.append(f"· {star}{bjt(r):%H:%M} {r['league']} {r['home']} vs {r['away']} {r['home_goals']}:{r['away_goals']}，"
                          f"{float(r['tau2']):.0f} 分钟 {mk}小 {_num(r['L2']):g}@{_num(r['u2']):.2f} → {res}")
+        if sub:
+            lines = ["（逐注见上面带 ⭐ 的）"] if mine else []
         sn = sum(done)
         c = hcum.setdefault(rule, [0, 0.0]); c[0] += len(done); c[1] += sn
         hdaily.append([tag, rule, len(mine), len(done), round(sn, 4)])
@@ -631,7 +661,7 @@ def xa_daily(out_dir):
         if not cfg["push"]:
             continue
         name = re.sub(r"（.*?）", "", cfg["title"].replace("👀 ", ""))
-        txt = f"【{name}（{cfg.get('status', '未验证，只观察不下')}；按{cfg.get('price', '推送时皇冠半场小的价')}、{endw}比分结算）】" + ("昨天没有推送。" if not mine else
+        txt = f"【{name}（{cfg.get('status', '未验证，只观察不下')}；按{cfg.get('price', '推送时皇冠半场小的价')}、{endw}比分结算）】" + (("昨天没有符合条件的注（只算周五六日）。" if sub else "昨天没有推送。") if not mine else
                                                         f"{len(mine)} 注：赢 {win} 走水 {push} 输 {len(done) - win - push}" +
                                                         (f"，{len(mine) - len(done)} 注没找到{endw}比分" if len(done) < len(mine) else "") +
                                                         f"，合计 {sn:+.2f}U" + (f"，每注 {sn / len(done):+.1%}" if done else ""))
@@ -800,14 +830,17 @@ if __name__ == "__main__":
                     hu_sent.add(("FT_GAP", mid))
                     kt, lg, hn, an = names_of(fix, mid)
                     c, b = fg["c"], fg["b"]
+                    lite = ft_lite(kt, lg, snap_utc)
                     wh.writerow([snap_utc, mid, lg, hn, an, b["h"], b["a"], "", c["tau"], c["L"], c["o"], c["u"], b["L"], b["o"], b["u"],
-                                 round(c["lam"], 4), round(b["lam"], 4), round(fg["gap"], 4), b["o"], b["L"], b["u"], "FT_GAP"]); fh.flush()
+                                 round(c["lam"], 4), round(b["lam"], 4), round(fg["gap"], 4), b["o"], b["L"], b["u"], "FT_GAP",
+                                 "1" if lite else "0"]); fh.flush()
                     if HU_RULES["FT_GAP"]["push"]:
-                        tg(f"{HU_RULES['FT_GAP']['title']}\n{lg} {hn} vs {an}  {b['h']}:{b['a']}，{c['tau']:.0f} 分钟\n"
+                        tg(f"{HU_RULES['FT_GAP']['title']}" + ("｜⭐ 精简版" if lite else "") + f"\n{lg} {hn} vs {an}  {b['h']}:{b['a']}，{c['tau']:.0f} 分钟\n"
                            f"皇冠全场 {c['L']:g} 小 {c['u']:.2f}｜bet365 全场 {b['L']:g} 小 {b['u']:.2f}\n"
                            f"bet365 算还剩 {b['lam']:.2f} 球，皇冠只算 {c['lam']:.2f} 球（差 {fg['gap']:.2f}）\n"
                            f"→ bet365 全场小 {b['L']:g} 水 {b['u']:.2f}\n"
-                           f"{HU_RULES['FT_GAP']['tag']}（越南时间 {datetime.now(VNT):%H:%M}）")
+                           f"{HU_RULES['FT_GAP']['tag']}" + (f"\n{HU_RULES['FT_GAP_LITE']['tag']}" if lite else "") +
+                           f"（越南时间 {datetime.now(VNT):%H:%M}）")
                 names = "".join(names_of(fix, mid)[1:])
                 fired = []
                 youth = any(b in names for b in YOUTH)
