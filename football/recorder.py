@@ -38,7 +38,8 @@ FIX_COLS = ["match_id", "kickoff_bjt", "league", "home", "away"]
 ALERT_COLS = ["snap_utc", "match_id", "league", "home", "away", "home_goals", "away_goals", "goal_min",
               "crown_first_over", "crown_first_line", "crown_first_under", "b365_first_over", "b365_first_line",
               "b365_first_under", "lam_crown", "lam_b365", "crown_now_over", "crown_now_line", "crown_now_under",
-              "b365_now_over", "b365_now_line", "b365_now_under", "rule"]
+              "b365_now_over", "b365_now_line", "b365_now_under", "rule",
+              "pick"]  # xa2 rows only: we / wd = a ✅ 精选 bet on a Fri-Sun / Mon-Thu football day, 0 = not one
 
 
 FAILS = [0, 0]  # failed requests, all requests in the current round
@@ -320,21 +321,44 @@ HU_RULES = {
 GAP_TAU, GAP_MIN, GAP_WMAX = (25.0, 35.0), 0.05, 0.70
 HU_COLS = ["snap_utc", "match_id", "league", "home", "away", "home_goals", "away_goals", "tau1", "tau2", "L1", "o1", "u1",
            "L2", "o2", "u2", "lam1", "lam2", "dev", "b365_o", "b365_L", "b365_u", "rule",  # bet365's half O/U as quoted
-           "lite"]  # FT_GAP rows only: 1 = also an FT_GAP_LITE bet
+           "lite",  # FT_GAP rows only: 1 = also an FT_GAP_LITE bet
+           "pick"]  # HT_GAP rows only: we / wd = a ✅ 精选 bet on a Fri-Sun / Mon-Thu football day, 0 = not one
 LITE_MAJOR = {"英超", "西甲", "意甲", "德甲", "法甲", "欧冠", "欧罗巴杯", "欧协联", "欧国联", "世欧预", "荷甲", "葡超", "英冠", "美职业",
               "巴西甲", "阿甲", "日职联", "韩K联", "沙特联", "土超", "比甲", "苏超", "澳超", "墨西联", "中超"}
 LITE_YOUTH = ["U1", "U2", "女", "后备", "预备", "青"]
 LITE_DROP = ["乙", "丙", "丁", "戊", "冠", "业余", "地区", "杯", "锦标"] + LITE_YOUTH
 
 
+def weekend(kt, snap_utc):
+    """The match's football day (Beijing kickoff - 12 h; without a kickoff, the snapshot's Beijing time - 12 h) is a
+    Friday, Saturday or Sunday: European Friday-Sunday matches, whatever the date in Vietnam."""
+    t = kt.astimezone(BJT).replace(tzinfo=None) if kt else datetime.strptime(snap_utc, "%Y-%m-%d %H:%M:%S") + timedelta(hours=8)
+    return (t - timedelta(hours=12)).weekday() >= 4
+
+
 def ft_lite(kt, league, snap_utc):
-    """FT_GAP_LITE filter (same as ft_gap_lite.py): the football day (Beijing kickoff - 12 h; without a kickoff, the
-    snapshot's Beijing time - 12 h) is Fri-Sun, and the league is not lower tier, cup, youth, women or reserve."""
+    """FT_GAP_LITE filter (same as ft_gap_lite.py): Fri-Sun football day, and the league is not lower tier, cup, youth,
+    women or reserve."""
     name = league or ""
     if any(k in name for k in LITE_YOUTH) or not (name in LITE_MAJOR or not any(k in name for k in LITE_DROP)):
         return False
-    t = kt.astimezone(BJT).replace(tzinfo=None) if kt else datetime.strptime(snap_utc, "%Y-%m-%d %H:%M:%S") + timedelta(hours=8)
-    return (t - timedelta(hours=12)).weekday() >= 4
+    return weekend(kt, snap_utc)
+
+
+# ✅ 精选: frozen 2026-11-07 (my-first-project scans/2026-10-21/kanpan/live/PREREG_pick.md). The user bets them on
+# Fri-Sun football days only (Mon-Thu: recorded, marked 📝). (1) an xa2 alert (adult) whose goal came at minute >= 61, with
+# the two books' gap at the prices showing at the push still >= 0.10 and bet365's under now >= 0.70; (2) an HT_GAP signal
+# whose under is >= 0.65.
+PICK_TAG = {"we": "✅ 精选（周五六日）：10-20~11-05 周末 xa 部分每注 +43%、半场部分 +14%（同一批数据挑的，11-07 起考两个周末）→ 想下就小注，盘口水位比推送差就别追",
+            "wd": "📝 精选·周中：周一到周四只记录不下（之前周中不赚）"}
+
+
+def xa_pick(x):
+    cn, bn, gl = x["c_now"], x["b_now"], x["h"] + x["a"]
+    if x["gm"] < 61 or None in cn + bn or not all(v == v for v in cn + bn) or bn[2] < 0.70:
+        return False
+    lc, lb = lam_rem(*cn, gl), lam_rem(*bn, gl)
+    return lc is not None and lb is not None and lb - lc >= 0.10
 
 
 def hu_lite(r):
@@ -713,6 +737,40 @@ def xa_daily(out_dir):
         if c[0]:
             txt += f"\n上线以来 {c[0]} 注，合计 {c[1]:+.2f}U，每注 {c[1] / c[0]:+.1%}"
         parts.append(txt)
+    # ✅ 精选: the xa2 alerts and HT_GAP signals flagged at the push, settled at the pushed price (full time / half time);
+    # Fri-Sun football days (the ones to bet) and Mon-Thu (recorded) apart, each with its total since 2026-11-07
+    picks = [("全场", r, sc.get(r["match_id"]), "b365_now_line", "b365_now_under") for rl, r in todays
+             if rl == "xa2" and r.get("pick") in ("we", "wd") and r["match_id"] not in voids]
+    picks += [("半场", r, ht.get(r["match_id"]), "L2", "u2") for rl, r in hu_today if rl == "HT_GAP" and r.get("pick") in ("we", "wd")]
+    plines, ptot = [], {"we": [], "wd": []}
+    for mk, r, k, lc, uc in sorted(picks, key=lambda p: bjt(p[1])):
+        L, u = _num(r[lc]), _num(r[uc])
+        pn = _settle(L, sum(k), u, True) if k else None
+        mn = f"{r['goal_min']} 分钟进球后" if mk == "全场" else f"{float(r['tau2']):.0f} 分钟"
+        endw = "完场" if mk == "全场" else "半场"
+        res = f"未找到{endw}比分" if pn is None else f"{endw} {k[0]}:{k[1]} " + ("赢" if pn > 0.01 else "走水" if abs(pn) <= 0.01 else "输") + f" {pn:+.2f}"
+        plines.append(f"· {bjt(r):%H:%M} {mk}小 {r['league']} {r['home']} vs {r['away']} {r['home_goals']}:{r['away_goals']}，{mn}"
+                      f" 小 {L:g}@{u:.2f} → {res}" + ("（周中，只记录）" if r["pick"] == "wd" else ""))
+        hbets.append([tag, "PICK_WE" if r["pick"] == "we" else "PICK_WD", r["match_id"], r["league"], r["home"], r["away"],
+                      r.get("goal_min") or r.get("tau2"), L, u, *(k or ("", "")), "" if pn is None else round(pn, 4)])
+        if pn is not None:
+            ptot[r["pick"]].append(pn)
+    ptxt = "【✅ 精选（周五六日的可小注，周一到周四只记录；按推送时的价）】" + ("昨天没有。" if not picks else "")
+    for pk, rl, lab in (("we", "PICK_WE", "周五六日"), ("wd", "PICK_WD", "周一到周四")):
+        v = ptot[pk]
+        n = sum(1 for p in picks if p[1]["pick"] == pk)
+        hdaily.append([tag, rl, n, len(v), round(sum(v), 4)])
+        c = hcum.setdefault(rl, [0, 0.0]); c[0] += len(v); c[1] += sum(v)
+        if n:
+            ptxt += (f"\n{lab} {n} 注：赢 {sum(1 for x in v if x > 0.01)} 输 {sum(1 for x in v if x < -0.01)}，合计 {sum(v):+.2f}U"
+                     + (f"，{n - len(v)} 注没找到比分" if len(v) < n else ""))
+    if plines:
+        ptxt += "\n" + "\n".join(plines)
+    for rl, lab in (("PICK_WE", "周五六日"), ("PICK_WD", "周一到周四")):
+        c = hcum.get(rl)
+        if c and c[0]:
+            ptxt += f"\n上线以来{lab} {c[0]} 注，合计 {c[1]:+.2f}U，每注 {c[1] / c[0]:+.1%}"
+    parts.insert(0, ptxt)
     with gzip.open(os.path.join(out_dir, f"hu_bets_{tag}.csv.gz"), "wt", newline="", encoding="utf-8") as fb:
         wb = csv.writer(fb)
         wb.writerow(["date", "rule", "match_id", "league", "home", "away", "minute", "line", "under", "ht_home", "ht_away", "pnl"])
@@ -776,6 +834,7 @@ if __name__ == "__main__":
            f"每条标明能不能下；半场两家分歧、全场两家分歧（都未验证）和半场小早版（已考未通过）也推，只看不下；进球被取消会再推一条作废；每天越南时间 {DAILY_HOUR} 点推昨日总结。")
     fix, fix_t, written, seen_fix, alerted, daily_next = {}, 0.0, 0, set(), set(), 0.0
     hu_sent = set()
+    picked = {}  # (match, home goals, away goals) -> we / wd: the goal's xa2 alert is a ✅ 精选 bet
     alert_goals = {}  # match -> total goals when its alert went out (to spot a goal that is taken back)
     paths, files = open_part(datetime.now(timezone.utc).strftime("%Y%m%d_%H%M"))
     part_t = time.time()
@@ -853,14 +912,17 @@ if __name__ == "__main__":
                     hu_sent.add(("HT_GAP", mid))
                     kt, lg, hn, an = names_of(fix, mid)
                     gen, oth, b = gp["gen"], gp["oth"], gp["b"]
+                    pk = ("we" if weekend(kt, snap_utc) else "wd") if gen["u"] >= 0.65 else "0"
                     wh.writerow([snap_utc, mid, lg, hn, an, gen["h"], gen["a"], "", gp["c"]["tau"], oth["L"], oth["o"], oth["u"],
                                  gen["L"], gen["o"], gen["u"], round(oth["lam"], 4), round(gen["lam"], 4), round(gp["gap"], 4),
-                                 b["o"], b["L"], b["u"], "HT_GAP"]); fh.flush()
+                                 b["o"], b["L"], b["u"], "HT_GAP", "", pk]); fh.flush()
                     if HU_RULES["HT_GAP"]["push"]:
-                        tg(f"{HU_RULES['HT_GAP']['title']}\n{lg} {hn} vs {an}  {gen['h']}:{gen['a']}，{gp['c']['tau']:.0f} 分钟\n"
+                        tg(f"{HU_RULES['HT_GAP']['title']}" + {"we": "｜✅ 精选", "wd": "｜📝 精选·周中"}.get(pk, "") +
+                           f"\n{lg} {hn} vs {an}  {gen['h']}:{gen['a']}，{gp['c']['tau']:.0f} 分钟\n"
                            f"皇冠半场 {gp['c']['L']:g} 小 {gp['c']['u']:.2f}｜bet365 半场 {b['L']:g} 小 {b['u']:.2f}\n"
                            f"{gp['book']} 算上半场还剩 {gen['lam']:.2f} 球，{gp['other']}只算 {oth['lam']:.2f} 球（差 {abs(gp['gap']):.2f}）\n"
                            f"→ {gp['book']} 半场小 {gen['L']:g} 水 {gen['u']:.2f}\n"
+                           + (f"{PICK_TAG[pk]}\n" if pk in PICK_TAG else "") +
                            f"{HU_RULES['HT_GAP']['tag']}（越南时间 {datetime.now(VNT):%H:%M}）")
                 fg = ft_gap_check(rows) if rows and ("FT_GAP", mid) not in hu_sent else None
                 if fg:
@@ -891,8 +953,11 @@ if __name__ == "__main__":
                     alerted.add((rule, mid))
                     alert_goals[mid] = x["h"] + x["a"]
                     kt, lg, hn, an = names_of(fix, mid)
+                    pk = "" if rule != "xa2" else ("we" if weekend(kt, snap_utc) else "wd") if xa_pick(x) else "0"
+                    if pk in ("we", "wd"):
+                        picked[(mid, x["h"], x["a"])] = pk
                     wa.writerow([snap_utc, mid, lg, hn, an, x["h"], x["a"], x["gm"], *x["c"], *x["b"], round(x["lc"], 3),
-                                 round(x["lb"], 3), *x["c_now"], *x["b_now"], rule]); fa.flush()
+                                 round(x["lb"], 3), *x["c_now"], *x["b_now"], rule, pk]); fa.flush()
                     if cfg["push"]:
                         fired.append((cfg["name"], x, lg, hn, an))
                 if fired:  # one message per match and goal, naming every rule that fired on it
@@ -901,6 +966,7 @@ if __name__ == "__main__":
                         by_goal.setdefault((x["h"], x["a"]), []).append((nm, x, lg, hn, an))
                     for group in by_goal.values():
                         _, x, lg, hn, an = group[0]
+                        pk = picked.get((mid, x["h"], x["a"]))
                         bn = x["b_now"]
                         tags = [RULES[k]["tag"] for k in RULES if RULES[k]["name"] in {g[0] for g in group}]
                         need = min(RULES[k]["gap"] for k in RULES if RULES[k]["name"] in {g[0] for g in group})
@@ -910,7 +976,10 @@ if __name__ == "__main__":
                         if lc2 is not None and lb2 is not None:
                             tags.append(f"现在两家价差 {lb2 - lc2:+.2f}（模型要求 ≥{need:.2f}）"
                                         + ("" if lb2 - lc2 >= need else "：⚠️ 已经不够，这注别追"))
-                        tg(f"⚽ 小球信号：{' + '.join(g[0] for g in group)}\n{lg} {hn} vs {an}  {x['h']}:{x['a']}，"
+                        if pk:
+                            tags.insert(0, PICK_TAG[pk])
+                        tg(f"⚽ 小球信号：{' + '.join(g[0] for g in group)}" + {"we": "｜✅ 精选", "wd": "｜📝 精选·周中"}.get(pk, "") +
+                           f"\n{lg} {hn} vs {an}  {x['h']}:{x['a']}，"
                            f"{x['gm']} 分钟进球后\nbet365 第一口：全场 {x['b'][1]:g} 小 {x['b'][2]:.2f}｜皇冠第一口：{x['c'][1]:g} 小 {x['c'][2]:.2f}\n"
                            f"→ bet365 全场小" + (f"，现在 {bn[1]:g} 小 {bn[2]:.2f}" if bn[1] is not None else "") +
                            "\n" + "\n".join(tags) +
