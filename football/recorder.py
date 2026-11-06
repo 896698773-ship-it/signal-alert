@@ -503,6 +503,49 @@ def git(*a):
         return None
 
 
+SAVE_EVERY = int(os.environ.get("SAVE_EVERY", "3600"))  # seconds: each hour the files are closed, saved and a new set started
+
+
+def open_part(stamp):
+    """The run's five data files for the part starting now (a new set every SAVE_EVERY), with their header rows."""
+    paths = [os.path.join(OUT, f"{stamp}{s}.csv.gz") for s in ("", "_fixtures", "_alerts", "_voids", "_hu")]
+    files = [gzip.open(p, "wt", newline="", encoding="utf-8") for p in paths]
+    for fl, hdr in zip(files, (COLS, FIX_COLS, ALERT_COLS, ["snap_utc", "match_id", "alert_goals", "now_goals"], HU_COLS)):
+        csv.writer(fl).writerow(hdr)
+    return paths, files
+
+
+def save_files(paths):
+    """Commit these finished files to data/ on the football-data branch while the run goes on, so a runner that is lost
+    (2026-11-06: no last step, an hour of data gone) loses at most the current part. Plumbing commands and a temporary
+    index: the job's checkout is left alone. The job's last step saves every file again anyway. True when pushed."""
+    me = "football-recorder"
+    env = dict(os.environ, GIT_INDEX_FILE=os.path.abspath(os.path.join(OUT, ".fd_index")), GIT_AUTHOR_NAME=me, GIT_COMMITTER_NAME=me,
+               GIT_AUTHOR_EMAIL=f"{me}@users.noreply.github.com", GIT_COMMITTER_EMAIL=f"{me}@users.noreply.github.com")
+
+    def run(*a):
+        try:
+            r = subprocess.run(["git", *a], capture_output=True, timeout=60, env=env)
+            return r.stdout.decode().strip() if r.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError):
+            return None
+    for _ in range(2):  # once more if another push got there first
+        if run("fetch", "-q", "origin", "+refs/heads/football-data:refs/remotes/origin/football-data") is None:
+            break
+        parent = run("rev-parse", "refs/remotes/origin/football-data")
+        ok = bool(parent) and run("read-tree", parent) is not None
+        for p in paths if ok else []:
+            blob = run("hash-object", "-w", p)
+            ok = ok and bool(blob) and run("update-index", "--add", "--cacheinfo", f"100644,{blob},data/{os.path.basename(p)}") is not None
+        tree = run("write-tree") if ok else None
+        commit = run("commit-tree", tree, "-p", parent, "-m", f"football data {datetime.now(timezone.utc):%Y-%m-%d_%H%M} (hourly)") if tree else None
+        if commit and run("push", "-q", "origin", f"{commit}:refs/heads/football-data") is not None:
+            print(f"saved {len(paths)} files to football-data", flush=True)
+            return True
+    print("hourly save failed (the job's last step saves the files anyway)", flush=True)
+    return False
+
+
 def gz_rows(data):
     """CSV rows (dicts) of a gzip file's bytes; a file without its end marker is read up to where it stops."""
     out = []
@@ -731,20 +774,14 @@ if __name__ == "__main__":
     if os.environ.get("GITHUB_EVENT_NAME", "schedule") != "schedule":  # manual start: say it is running
         tg("⚽ 足球记录器已启动：下半场每 30 秒、其他每分钟盯皇冠和 bet365 的滚球盘。xa / xa3 / xa2（含青年、女足）有信号就推，"
            f"每条标明能不能下；半场两家分歧、全场两家分歧（都未验证）和半场小早版（已考未通过）也推，只看不下；进球被取消会再推一条作废；每天越南时间 {DAILY_HOUR} 点推昨日总结。")
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
-    path, fpath = os.path.join(OUT, f"{stamp}.csv.gz"), os.path.join(OUT, f"{stamp}_fixtures.csv.gz")
-    apath = os.path.join(OUT, f"{stamp}_alerts.csv.gz")
-    vpath = os.path.join(OUT, f"{stamp}_voids.csv.gz")
-    hpath = os.path.join(OUT, f"{stamp}_hu.csv.gz")
     fix, fix_t, written, seen_fix, alerted, daily_next = {}, 0.0, 0, set(), set(), 0.0
     hu_sent = set()
     alert_goals = {}  # match -> total goals when its alert went out (to spot a goal that is taken back)
-    with gzip.open(path, "wt", newline="", encoding="utf-8") as f, gzip.open(fpath, "wt", newline="", encoding="utf-8") as ff, \
-            gzip.open(apath, "wt", newline="", encoding="utf-8") as fa, gzip.open(vpath, "wt", newline="", encoding="utf-8") as fv, \
-            gzip.open(hpath, "wt", newline="", encoding="utf-8") as fh:
-        w, wf, wa, wv, wh = csv.writer(f), csv.writer(ff), csv.writer(fa), csv.writer(fv), csv.writer(fh)
-        w.writerow(COLS); wf.writerow(FIX_COLS); wa.writerow(ALERT_COLS); wv.writerow(["snap_utc", "match_id", "alert_goals", "now_goals"])
-        wh.writerow(HU_COLS)
+    paths, files = open_part(datetime.now(timezone.utc).strftime("%Y%m%d_%H%M"))
+    part_t = time.time()
+    try:
+        f, ff, fa, fv, fh = files
+        w, wf, wa, wv, wh = (csv.writer(x) for x in files)
         last_full, prev, active, slow_until, playing, sig, half2, rnd = 0.0, {}, set(), 0.0, set(), {}, set(), 0
         handed = False
         while time.time() - t0 < DURATION:
@@ -904,8 +941,20 @@ if __name__ == "__main__":
                 print("handing over to the next run", flush=True)
                 handed = True
                 break
+            if time.time() - part_t >= SAVE_EVERY and left > SAVE_EVERY / 4:  # near the end the job's last step saves them
+                for x in files:
+                    x.close()
+                LAST_ROUND[0] = time.time()  # the save takes seconds, not a stuck round
+                save_files(paths + sorted(glob.glob(os.path.join(OUT, "xa_*.csv.gz")) + glob.glob(os.path.join(OUT, "hu_*.csv.gz"))))
+                paths, files = open_part(datetime.now(timezone.utc).strftime("%Y%m%d_%H%M"))
+                f, ff, fa, fv, fh = files
+                w, wf, wa, wv, wh = (csv.writer(x) for x in files)
+                seen_fix, part_t = set(), time.time()  # each part lists the fixtures of its own matches
             LAST_ROUND[0] = time.time()
             time.sleep(max(1, min(left, GOAL_STEP - (time.time() - round_t))))
+    finally:
+        for x in files:
+            x.close()
     if not handed:  # time is up and no run was waiting (GitHub skipped or delayed the schedule): start the next one
         # (until 2026-11-03 this only happened when a round ended past the time limit, so most runs that ran out of
         # time ended without a successor and recording stopped until the next scheduled run, sometimes for hours)
